@@ -465,6 +465,118 @@ def build_marketing_tools(vector_store, tavily_adapter=None, dalle_adapter=None)
             f"- Subject lines que generen apertura (pregunta, numero, curiosidad)"
         )
 
+    # ---- Multi-idioma ----
+
+    @tool
+    def translate_campaign_content(
+        content: str,
+        target_language: str = "en",
+        adapt_culturally: bool = True,
+    ) -> str:
+        """Traduce y adapta culturalmente contenido de marketing a otro idioma.
+        Usa esta herramienta cuando necesites versiones en multiples idiomas.
+        target_language: en (ingles), pt (portugues), fr (frances), etc.
+        Si adapt_culturally=True, no traduce literal sino que adapta modismos y CTAs."""
+        return (
+            f"TRADUCE Y ADAPTA:\n"
+            f"Idioma destino: {target_language}\n"
+            f"Adaptacion cultural: {'Si' if adapt_culturally else 'No (literal)'}\n"
+            f"Contenido original:\n{content}\n\n"
+            f"REGLAS:\n"
+            f"- NO traducir literalmente, ADAPTAR al mercado del idioma destino\n"
+            f"- Adaptar modismos, referencias culturales y humor\n"
+            f"- Mantener el tono y la intencion del mensaje\n"
+            f"- Adaptar hashtags al idioma destino\n"
+            f"- Si es para Brasil (pt-BR): adaptar a cultura brasilena\n"
+            f"- Si es para USA (en): adaptar a cultura americana\n"
+            f"- Mantener emojis y formato"
+        )
+
+    # ---- Analisis de rendimiento (performance learning) ----
+
+    @tool
+    def analyze_past_performance(performance_data: str) -> str:
+        """Analiza el rendimiento de campanas/ads anteriores para aprender que funciono.
+        Usa esta herramienta cuando tengas datos de rendimiento de Meta Ads anteriores.
+        Pasa los datos como texto con metricas (CTR, CPC, conversiones, etc.)."""
+        return (
+            f"ANALIZA RENDIMIENTO PASADO:\n{performance_data}\n\n"
+            f"EXTRAE:\n"
+            f"1. Que tipo de contenido tuvo mejor CTR? (copy, formato, canal)\n"
+            f"2. Que audiencia convirtio mejor?\n"
+            f"3. Que horarios funcionaron?\n"
+            f"4. Que CPC/CPM es realista para este negocio?\n"
+            f"5. Que NO funciono y debemos evitar?\n"
+            f"6. Recomendaciones concretas para la proxima campana\n\n"
+            f"APLICA ESTAS LECCIONES en todo el contenido que generes."
+        )
+
+    @tool
+    def suggest_optimization(current_metrics: str, target_kpi: str = "CTR") -> str:
+        """Sugiere optimizaciones para mejorar un KPI especifico basandose en metricas actuales.
+        Usa cuando NestJS reporte que una campana activa no alcanza sus metas."""
+        return (
+            f"OPTIMIZA PARA MEJORAR {target_kpi}:\n"
+            f"Metricas actuales:\n{current_metrics}\n\n"
+            f"SUGIERE CAMBIOS EN:\n"
+            f"1. Copy: nuevo headline o body que pueda mejorar {target_kpi}\n"
+            f"2. Audiencia: ajustar targeting\n"
+            f"3. Presupuesto: redistribuir entre ad sets\n"
+            f"4. Creative: nueva imagen o formato\n"
+            f"5. Schedule: cambiar horarios de publicacion\n"
+            f"6. CTA: probar otro call to action\n"
+            f"Prioriza los cambios de mayor impacto primero."
+        )
+
+    # ---- Multi-plataforma ----
+
+    @tool
+    def adapt_for_google_ads(content: str, campaign_type: str = "search") -> str:
+        """Adapta contenido de marketing para Google Ads (Search, Display, Shopping).
+        campaign_type: search | display | shopping | youtube.
+        Usa cuando la campana incluya Google Ads ademas de Meta."""
+        limits = {
+            "search": "Headlines: max 30 chars (x15). Descriptions: max 90 chars (x4).",
+            "display": "Headline: max 30 chars. Long headline: max 90 chars. Description: max 90 chars.",
+            "shopping": "Title: max 150 chars. Description: max 5000 chars.",
+            "youtube": "Headline: max 15 chars. Long headline: max 90 chars. Description: max 70 chars.",
+        }
+        return (
+            f"ADAPTA PARA GOOGLE ADS ({campaign_type.upper()}):\n"
+            f"Contenido original (Meta):\n{content}\n\n"
+            f"LIMITES DE GOOGLE ADS {campaign_type.upper()}:\n"
+            f"{limits.get(campaign_type, limits['search'])}\n\n"
+            f"REGLAS GOOGLE ADS:\n"
+            f"- Google Ads es mas directo/informativo que Meta (el usuario ya esta buscando)\n"
+            f"- Incluir keywords del negocio en los headlines\n"
+            f"- Search: foco en intencion de compra, no engagement\n"
+            f"- Display: visual + brand awareness\n"
+            f"- Incluir extensiones: sitelinks, callouts, precio\n"
+            f"- Generar multiples variaciones de headlines para que Google optimice"
+        )
+
+    @tool
+    def adapt_for_tiktok(content: str, trend_style: str = "storytelling") -> str:
+        """Adapta contenido de marketing para TikTok Ads.
+        trend_style: storytelling | ugc | educational | meme | challenge.
+        TikTok requiere un tono completamente diferente a Meta."""
+        return (
+            f"ADAPTA PARA TIKTOK ADS:\n"
+            f"Contenido original (Meta):\n{content}\n\n"
+            f"Estilo trending: {trend_style}\n\n"
+            f"REGLAS TIKTOK:\n"
+            f"- NO parece publicidad. Debe parecer contenido organico de un creator\n"
+            f"- Hook en los primeros 2 segundos o pierdes al usuario\n"
+            f"- Formato vertical 9:16\n"
+            f"- Duracion ideal: 15-30 segundos\n"
+            f"- Usa trending sounds/music (indica cual)\n"
+            f"- Texto en pantalla es OBLIGATORIO (muchos ven sin sonido)\n"
+            f"- Storytelling: problema → solucion → resultado\n"
+            f"- UGC style: que parezca grabado con celular, no produccion\n"
+            f"- CTA: 'Link en bio' o 'Comentame X para info'\n"
+            f"- NO hashtags corporativos, usa trending hashtags de TikTok"
+        )
+
     # ---- Retornar todas las herramientas ----
 
     tools = [
@@ -481,6 +593,14 @@ def build_marketing_tools(vector_store, tavily_adapter=None, dalle_adapter=None)
         generate_ab_variations,
         generate_video_script,
         generate_email_sequence,
+        # Multi-idioma
+        translate_campaign_content,
+        # Performance learning
+        analyze_past_performance,
+        suggest_optimization,
+        # Multi-plataforma
+        adapt_for_google_ads,
+        adapt_for_tiktok,
         # Calidad
         review_campaign_quality,
         # Web (Tavily)
