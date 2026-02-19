@@ -577,7 +577,165 @@ def build_marketing_tools(vector_store, tavily_adapter=None, dalle_adapter=None)
             f"- NO hashtags corporativos, usa trending hashtags de TikTok"
         )
 
-    # ---- Retornar todas las herramientas ----
+    # ── SEO Content ──
+
+    @tool
+    def research_seo_keywords(
+        business_type: str,
+        location: str = "",
+        language: str = "es",
+    ) -> str:
+        """Investiga keywords SEO para el negocio.
+        Retorna keywords primarias, secundarias, long-tail, y volumen estimado.
+        Usa esto ANTES de generar contenido SEO."""
+        web_results = ""
+        if tavily_adapter and tavily_adapter._api_key:
+            try:
+                web_results = tavily_adapter.search(
+                    f"mejores keywords SEO para {business_type} {location} {language} 2026"
+                )
+            except Exception:
+                web_results = ""
+
+        return (
+            f"INVESTIGA KEYWORDS SEO:\n"
+            f"Negocio: {business_type}\n"
+            f"Ubicacion: {location}\n"
+            f"Idioma: {language}\n"
+            f"Datos web: {web_results[:500] if web_results else 'No disponible'}\n\n"
+            f"GENERA:\n"
+            f"1. 5 keywords primarias (alto volumen, alta competencia)\n"
+            f"2. 10 keywords secundarias (medio volumen)\n"
+            f"3. 15 keywords long-tail (bajo volumen, baja competencia, alta conversion)\n"
+            f"4. Intento de busqueda de cada keyword (informacional/transaccional/navegacional)\n"
+            f"5. Dificultad estimada (facil/media/dificil)\n"
+            f"Formato: tabla con keyword | volumen_estimado | dificultad | intento"
+        )
+
+    @tool
+    def generate_seo_blog_post(
+        topic: str,
+        primary_keyword: str,
+        secondary_keywords: str = "",
+        word_count: int = 1500,
+        tone: str = "profesional",
+    ) -> str:
+        """Genera un blog post completo optimizado para SEO.
+        Incluye titulo H1, meta description, estructura H2/H3, internal linking suggestions."""
+        return (
+            f"GENERA BLOG POST SEO-OPTIMIZADO:\n"
+            f"Tema: {topic}\n"
+            f"Keyword primaria: {primary_keyword}\n"
+            f"Keywords secundarias: {secondary_keywords}\n"
+            f"Palabras: ~{word_count}\n"
+            f"Tono: {tone}\n\n"
+            f"ESTRUCTURA OBLIGATORIA:\n"
+            f"- Titulo H1: incluir keyword primaria, <60 chars, atractivo para clicks\n"
+            f"- Meta description: 150-160 chars, incluir keyword, con CTA\n"
+            f"- Intro: hook + keyword en primer parrafo + preview del contenido\n"
+            f"- 4-6 secciones H2 (incluir keywords secundarias naturalmente)\n"
+            f"- Sub-secciones H3 donde tenga sentido\n"
+            f"- Listas con bullets (Google las prefiere para featured snippets)\n"
+            f"- FAQ section al final (3-5 preguntas = oportunidad de featured snippet)\n"
+            f"- Conclusion con CTA\n"
+            f"- Sugerencias de internal links: [anchortext](URL_sugerida)\n\n"
+            f"REGLAS SEO:\n"
+            f"- Densidad keyword primaria: 1-2% (natural, no spam)\n"
+            f"- Usar keyword en primer H2 y ultimo H2\n"
+            f"- Alt text sugerido para imagenes\n"
+            f"- Schema markup suggestion (Article, FAQ, HowTo)\n"
+            f"- Readability: oraciones cortas, parrafos de 2-3 lineas max"
+        )
+
+    @tool
+    def generate_meta_tags(
+        page_title: str,
+        page_description: str,
+        primary_keyword: str,
+    ) -> str:
+        """Genera meta tags SEO optimizados para una pagina web.
+        Title tag, meta description, Open Graph, Twitter Cards."""
+        return (
+            f"GENERA META TAGS SEO:\n"
+            f"Pagina: {page_title}\n"
+            f"Descripcion: {page_description}\n"
+            f"Keyword: {primary_keyword}\n\n"
+            f"GENERA:\n"
+            f"1. <title> tag: keyword al inicio, marca al final, <60 chars\n"
+            f"2. <meta description>: 150-160 chars, keyword natural, CTA, unique\n"
+            f"3. <meta keywords>: 5-8 keywords relevantes\n"
+            f"4. Open Graph tags (og:title, og:description, og:type, og:image suggestion)\n"
+            f"5. Twitter Card tags\n"
+            f"6. Schema.org JSON-LD suggestion para el tipo de pagina\n"
+            f"Formato: HTML listo para copiar/pegar"
+        )
+
+    @tool
+    def check_content_seo_score(content: str, target_keyword: str) -> str:
+        """Analiza contenido existente y calcula un SEO score con recomendaciones.
+        Retorna score 0-100 y accionables para mejorar."""
+        word_count = len(content.split())
+        keyword_count = content.lower().count(target_keyword.lower())
+        density = (keyword_count / max(word_count, 1)) * 100
+
+        has_h2 = "##" in content or "<h2" in content.lower()
+        has_lists = "- " in content or "* " in content or "<li" in content.lower()
+        has_links = "[" in content and "](" in content or "<a " in content.lower()
+
+        return (
+            f"ANALISIS SEO DEL CONTENIDO:\n"
+            f"Palabras: {word_count}\n"
+            f"Keyword '{target_keyword}' aparece: {keyword_count} veces\n"
+            f"Densidad keyword: {density:.1f}%\n"
+            f"Tiene H2s: {'Si' if has_h2 else 'No'}\n"
+            f"Tiene listas: {'Si' if has_lists else 'No'}\n"
+            f"Tiene links: {'Si' if has_links else 'No'}\n\n"
+            f"EVALUA Y CALIFICA 0-100:\n"
+            f"- Titulo (keyword, longitud, atractivo): /20\n"
+            f"- Densidad keyword (ideal 1-2%): /15\n"
+            f"- Estructura (H2, H3, listas): /20\n"
+            f"- Longitud (ideal >1000 palabras): /15\n"
+            f"- Readability (oraciones cortas, simple): /15\n"
+            f"- Links internos/externos: /15\n"
+            f"Total: /100\n\n"
+            f"RECOMENDACIONES (maximo 5 accionables prioritarios)"
+        )
+
+    # ── Plagiarism Check ──
+
+    @tool
+    def check_plagiarism(content: str, content_type: str = "ad_copy") -> str:
+        """Verifica originalidad del contenido.
+        Busca frases clave en web para detectar si es copia de otro ad/blog.
+        content_type: ad_copy | blog_post | email | social_post"""
+        sentences = [s.strip() for s in content.replace("\n", ". ").split(". ") if len(s.strip()) > 20]
+        check_sentences = sentences[:5]
+
+        web_matches = []
+        if tavily_adapter and tavily_adapter._api_key:
+            for sentence in check_sentences[:3]:
+                try:
+                    results = tavily_adapter.search(f'"{sentence}"')
+                    if results and "no results" not in results.lower():
+                        web_matches.append({"sentence": sentence, "web_result": results[:300]})
+                except Exception:
+                    pass
+
+        return (
+            f"ANALISIS DE ORIGINALIDAD:\n"
+            f"Tipo: {content_type}\n"
+            f"Oraciones analizadas: {len(check_sentences)}\n"
+            f"Coincidencias web encontradas: {len(web_matches)}\n\n"
+            f"{'COINCIDENCIAS:' if web_matches else 'No se encontraron copias directas.'}\n"
+            + "\n".join(f"- '{m['sentence']}' → {m['web_result']}" for m in web_matches)
+            + f"\n\nEVALUA:\n"
+            f"- Originalidad estimada: X/100\n"
+            f"- Riesgo de plagio: bajo/medio/alto\n"
+            f"- Si hay coincidencias, sugiere reescribir las frases similares\n"
+            f"- Verifica que CTAs y slogans no sean de competidores conocidos"
+        )
+
+    # ── Retornar todas las herramientas ──
 
     tools = [
         # Investigacion
@@ -601,6 +759,13 @@ def build_marketing_tools(vector_store, tavily_adapter=None, dalle_adapter=None)
         # Multi-plataforma
         adapt_for_google_ads,
         adapt_for_tiktok,
+        # SEO
+        research_seo_keywords,
+        generate_seo_blog_post,
+        generate_meta_tags,
+        check_content_seo_score,
+        # Plagiarism
+        check_plagiarism,
         # Calidad
         review_campaign_quality,
         # Web (Tavily)
