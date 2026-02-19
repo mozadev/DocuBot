@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     chunk_size: int = Field(1000, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(200, alias="CHUNK_OVERLAP")
 
+    # --- Multimodal / Visión ---
+    vision_model: str = Field("gpt-4o", alias="VISION_MODEL")
+    images_path: str = Field("./data/images", alias="IMAGES_PATH")
+    enable_multimodal: bool = Field(True, alias="ENABLE_MULTIMODAL")
+    min_image_size: int = Field(100, alias="MIN_IMAGE_SIZE")  # px mínimo ancho/alto para procesar
+
+    # --- Tavily (busqueda web para agentes AI) ---
+    tavily_api_key: str = Field("", alias="TAVILY_API_KEY")
+
     # --- Logging ---
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     log_file: str = Field("./logs/app.log", alias="LOG_FILE")
@@ -47,4 +56,5 @@ settings = Settings()
 
 # Crear directorios necesarios
 os.makedirs(settings.lancedb_path, exist_ok=True)
+os.makedirs(settings.images_path, exist_ok=True)
 os.makedirs(os.path.dirname(settings.log_file), exist_ok=True)
