@@ -735,6 +735,48 @@ def build_marketing_tools(vector_store, tavily_adapter=None, dalle_adapter=None)
             f"- Verifica que CTAs y slogans no sean de competidores conocidos"
         )
 
+    # ── LinkedIn Ads (B2B) ──
+
+    @tool
+    def adapt_for_linkedin(
+        content: str,
+        objective: str = "lead_generation",
+        ad_format: str = "single_image",
+    ) -> str:
+        """Adapta contenido de marketing para LinkedIn Ads (B2B).
+        objective: lead_generation | brand_awareness | website_visits | engagement.
+        ad_format: single_image | carousel | video | text_ad | message_ad | document_ad."""
+        return (
+            f"ADAPTA PARA LINKEDIN ADS (B2B):\n"
+            f"Contenido original:\n{content}\n\n"
+            f"Objetivo: {objective}\n"
+            f"Formato: {ad_format}\n\n"
+            f"REGLAS LINKEDIN:\n"
+            f"- Tono PROFESIONAL. Nada de emojis excesivos ni lenguaje casual\n"
+            f"- Enfocate en ROI, eficiencia, resultados medibles, casos de exito\n"
+            f"- Headline: maximo 70 chars, directo al pain point del decision-maker\n"
+            f"- Intro text: maximo 150 chars para el preview (antes del 'ver mas')\n"
+            f"- Body: datos, estadisticas, social proof ('500+ empresas confian en...')\n"
+            f"- CTA profesional: 'Solicitar demo' / 'Descargar whitepaper' / 'Agendar reunion'\n"
+            f"- NO 'Compra ya' ni urgencia artificial. LinkedIn penaliza eso\n\n"
+            f"TARGETING SUGERIDO:\n"
+            f"- Job titles relevantes (CEO, Director, Gerente de...)\n"
+            f"- Industrias objetivo\n"
+            f"- Tamano de empresa (1-50, 51-200, 201-1000, 1000+)\n"
+            f"- Seniority level\n\n"
+            f"FORMATOS ESPECIFICOS:\n"
+            f"- single_image: imagen profesional, no stock generico. Texto en imagen minimo\n"
+            f"- carousel: 3-5 slides tipo presentacion ejecutiva\n"
+            f"- video: 30-90 seg, subtitulos obligatorios, testimonial o demo\n"
+            f"- text_ad: headline 25 chars + descripcion 75 chars (muy corto)\n"
+            f"- message_ad: InMail personalizado, como si fuera de persona a persona\n"
+            f"- document_ad: PDF descargable (lead magnet), titulo atractivo\n\n"
+            f"METRICAS LINKEDIN:\n"
+            f"- CTR promedio: 0.4-0.6% (mas bajo que Meta pero leads mas calificados)\n"
+            f"- CPC promedio: $5-12 USD (mas caro pero mayor valor por lead)\n"
+            f"- Mejor dia: martes a jueves, 8-10am horario del target"
+        )
+
     # ── Retornar todas las herramientas ──
 
     tools = [
@@ -759,6 +801,7 @@ def build_marketing_tools(vector_store, tavily_adapter=None, dalle_adapter=None)
         # Multi-plataforma
         adapt_for_google_ads,
         adapt_for_tiktok,
+        adapt_for_linkedin,
         # SEO
         research_seo_keywords,
         generate_seo_blog_post,
