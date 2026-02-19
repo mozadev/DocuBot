@@ -14,6 +14,8 @@ from domain.services.chat_service import ChatService
 from domain.services.marketing_service import MarketingService
 from adapters.search.tavily_adapter import TavilyAdapter
 from adapters.image.dalle_adapter import DalleAdapter
+from adapters.cache.semantic_cache import SemanticCache
+from adapters.observability.tracer import AgentTracer
 from agents.graph import build_agent_graph
 from agents.marketing_graph import build_marketing_agent_graph
 from core.logger import logger

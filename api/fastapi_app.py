@@ -22,6 +22,9 @@ from domain.models import (
     BusinessContext, ProductInfo, WhatsAppMetrics,
     SalesData, PreviousAdPerformance,
 )
+from domain.guardrails import ContentGuardrails
+from adapters.cache.semantic_cache import SemanticCache
+from adapters.observability.tracer import AgentTracer, SpanType
 from core.logger import logger
 
 
@@ -163,7 +166,16 @@ async def lifespan(app: FastAPI):
     _services["chat"] = chat_svc
     _services["mkt"] = mkt_svc
     _services["dalle"] = dalle
-    logger.info("FastAPI: servicios listos")
+    _services["cache"] = SemanticCache(max_entries=1000, default_ttl=3600)
+    _services["tracer"] = AgentTracer(max_traces=500)
+    _services["guardrails"] = ContentGuardrails()
+
+    from api.streaming import create_streaming_routes
+    from api.webhooks import create_webhook_routes
+    app.include_router(create_streaming_routes(_services))
+    app.include_router(create_webhook_routes(_services))
+
+    logger.info("FastAPI: servicios listos (con cache, tracer, guardrails, streaming, webhooks)")
     yield
     _services.clear()
     logger.info("FastAPI: servicios liberados")
@@ -821,3 +833,112 @@ async def translate_content(
         "original_language": "es",
         "translations": translations,
     }
+
+
+# ──────────────────────────── Guardrails ────────────────────────────
+
+class GuardrailCheckRequest(BaseModel):
+    content: str = Field(..., min_length=1)
+    industry: str = ""
+    brand_never_include: List[str] = Field(default_factory=list)
+    strict_mode: bool = False
+
+
+@app.post("/api/v1/guardrails/check", tags=["Guardrails"])
+async def check_content_safety(
+    body: GuardrailCheckRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Valida contenido contra reglas de seguridad de marca antes de publicar."""
+    guardrails = ContentGuardrails(
+        brand_never_include=body.brand_never_include,
+        industry=body.industry,
+        strict_mode=body.strict_mode,
+    )
+    result = guardrails.validate(body.content)
+    return {
+        "tenant_id": x_tenant_id,
+        **result.to_dict(),
+        "sanitized_content": result.sanitized_content,
+    }
+
+
+class CampaignGuardrailRequest(BaseModel):
+    campaign: dict = Field(..., description="Campana completa con strategy_summary y content_pieces")
+    industry: str = ""
+    brand_never_include: List[str] = Field(default_factory=list)
+
+
+@app.post("/api/v1/guardrails/check-campaign", tags=["Guardrails"])
+async def check_campaign_safety(
+    body: CampaignGuardrailRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Valida una campana completa contra reglas de seguridad de marca."""
+    guardrails = ContentGuardrails(
+        brand_never_include=body.brand_never_include,
+        industry=body.industry,
+    )
+    result = guardrails.validate_campaign(body.campaign)
+    return {"tenant_id": x_tenant_id, **result}
+
+
+# ──────────────────────────── Cache ────────────────────────────
+
+@app.get("/api/v1/cache/stats", tags=["Cache"])
+async def cache_stats(x_tenant_id: str = Header("default", alias="X-Tenant-ID")):
+    """Estadisticas del cache semantico — hit rate, ahorro estimado."""
+    cache: SemanticCache = _services.get("cache")
+    if not cache:
+        return {"error": "Cache not initialized"}
+    return {"tenant_id": x_tenant_id, **cache.get_stats()}
+
+
+@app.post("/api/v1/cache/invalidate", tags=["Cache"])
+async def invalidate_cache(x_tenant_id: str = Header("default", alias="X-Tenant-ID")):
+    """Invalida cache de un tenant (util cuando sube nuevos documentos)."""
+    cache: SemanticCache = _services.get("cache")
+    if not cache:
+        return {"error": "Cache not initialized"}
+    removed = cache.invalidate(x_tenant_id)
+    return {"tenant_id": x_tenant_id, "entries_removed": removed}
+
+
+# ──────────────────────────── Observability ────────────────────────────
+
+@app.get("/api/v1/observability/traces", tags=["Observability"])
+async def list_traces(
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Lista los ultimos traces de un tenant."""
+    tracer: AgentTracer = _services.get("tracer")
+    if not tracer:
+        return {"error": "Tracer not initialized"}
+    return {"tenant_id": x_tenant_id, "traces": tracer.get_tenant_traces(x_tenant_id, limit)}
+
+
+@app.get("/api/v1/observability/traces/{trace_id}", tags=["Observability"])
+async def get_trace_detail(
+    trace_id: str,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Detalle completo de un trace con todos sus spans."""
+    tracer: AgentTracer = _services.get("tracer")
+    if not tracer:
+        return {"error": "Tracer not initialized"}
+    trace = tracer.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return trace
+
+
+@app.get("/api/v1/observability/analytics", tags=["Observability"])
+async def get_analytics(
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Analiticas de uso: costos, tokens, latencia, tools mas usadas."""
+    tracer: AgentTracer = _services.get("tracer")
+    if not tracer:
+        return {"error": "Tracer not initialized"}
+    return {"tenant_id": x_tenant_id, **tracer.get_analytics(x_tenant_id)}
