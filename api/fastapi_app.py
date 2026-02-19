@@ -25,6 +25,7 @@ from domain.models import (
 from domain.guardrails import ContentGuardrails
 from adapters.cache.semantic_cache import SemanticCache
 from adapters.observability.tracer import AgentTracer, SpanType
+from api.rate_limiter import RateLimitMiddleware, get_rate_limiter
 from core.logger import logger
 
 
@@ -198,6 +199,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -835,6 +837,212 @@ async def translate_content(
     }
 
 
+# ──────────────────────────── SEO ────────────────────────────
+
+class SEOKeywordRequest(BaseModel):
+    business_type: str = Field(..., min_length=3)
+    location: str = ""
+    language: str = "es"
+
+
+class SEOBlogRequest(BaseModel):
+    topic: str = Field(..., min_length=5)
+    primary_keyword: str = Field(..., min_length=2)
+    secondary_keywords: List[str] = Field(default_factory=list)
+    word_count: int = Field(1500, ge=500, le=5000)
+    tone: str = "profesional"
+    business_context: Optional[BusinessContextSchema] = None
+
+
+class SEOMetaRequest(BaseModel):
+    page_title: str = Field(..., min_length=3)
+    page_description: str = Field(..., min_length=10)
+    primary_keyword: str = Field(..., min_length=2)
+
+
+class SEOScoreRequest(BaseModel):
+    content: str = Field(..., min_length=50)
+    target_keyword: str = Field(..., min_length=2)
+
+
+@app.post("/api/v1/seo/keywords", tags=["SEO"])
+async def research_keywords(
+    body: SEOKeywordRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Investiga keywords SEO: primarias, secundarias, long-tail con volumen estimado."""
+    mkt_svc = _services["mkt"]
+    result = mkt_svc._llm.invoke([
+        {"role": "system", "content": (
+            "Eres un experto SEO. Investiga keywords para este negocio. "
+            "Retorna una tabla con keyword | volumen_estimado | dificultad | intento_busqueda. "
+            "Incluye: 5 primarias, 10 secundarias, 15 long-tail."
+        )},
+        {"role": "user", "content": (
+            f"Negocio: {body.business_type}\n"
+            f"Ubicacion: {body.location}\n"
+            f"Idioma: {body.language}"
+        )},
+    ])
+    return {"tenant_id": x_tenant_id, "keywords": result}
+
+
+@app.post("/api/v1/seo/blog", tags=["SEO"])
+async def generate_seo_blog(
+    body: SEOBlogRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Genera un blog post completo optimizado para SEO con H1, H2, meta description, FAQ."""
+    mkt_svc = _services["mkt"]
+
+    rag_context = ""
+    biz_ctx = None
+    if body.business_context:
+        biz_ctx = _schema_to_business_context(body.business_context)
+    try:
+        results = _services["doc"].search(body.topic, k=3)
+        rag_context = "\n".join(r.chunk.content[:200] for r in results)
+    except Exception:
+        pass
+
+    secondary = ", ".join(body.secondary_keywords) if body.secondary_keywords else ""
+
+    result = mkt_svc._llm.invoke([
+        {"role": "system", "content": (
+            "Eres un content writer SEO experto. Genera blog posts que rankean en Google. "
+            "ESTRUCTURA: H1 (keyword, <60 chars) → Meta description (150-160 chars) → "
+            "Intro con keyword → 4-6 H2s → FAQ section → Conclusion con CTA. "
+            "Densidad keyword: 1-2%. Oraciones cortas. Incluye schema markup suggestion."
+        )},
+        {"role": "user", "content": (
+            f"Tema: {body.topic}\n"
+            f"Keyword primaria: {body.primary_keyword}\n"
+            f"Keywords secundarias: {secondary}\n"
+            f"Palabras: ~{body.word_count}\n"
+            f"Tono: {body.tone}\n"
+            f"Contexto del negocio: {rag_context[:500]}"
+        )},
+    ])
+    return {"tenant_id": x_tenant_id, "blog_post": result, "keyword": body.primary_keyword}
+
+
+@app.post("/api/v1/seo/meta-tags", tags=["SEO"])
+async def generate_meta_tags(
+    body: SEOMetaRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Genera meta tags SEO: title, description, Open Graph, Twitter Cards, Schema.org."""
+    mkt_svc = _services["mkt"]
+    result = mkt_svc._llm.invoke([
+        {"role": "system", "content": (
+            "Genera meta tags SEO optimizados. Incluye: "
+            "1) <title> (<60 chars, keyword al inicio) "
+            "2) <meta description> (150-160 chars) "
+            "3) Open Graph tags "
+            "4) Twitter Card tags "
+            "5) Schema.org JSON-LD. "
+            "Formato: HTML listo para copiar."
+        )},
+        {"role": "user", "content": (
+            f"Pagina: {body.page_title}\n"
+            f"Descripcion: {body.page_description}\n"
+            f"Keyword: {body.primary_keyword}"
+        )},
+    ])
+    return {"tenant_id": x_tenant_id, "meta_tags": result}
+
+
+@app.post("/api/v1/seo/score", tags=["SEO"])
+async def seo_score(
+    body: SEOScoreRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Analiza contenido existente y calcula SEO score 0-100 con recomendaciones."""
+    word_count = len(body.content.split())
+    keyword_count = body.content.lower().count(body.target_keyword.lower())
+    density = (keyword_count / max(word_count, 1)) * 100
+
+    mkt_svc = _services["mkt"]
+    result = mkt_svc._llm.invoke([
+        {"role": "system", "content": (
+            "Eres un auditor SEO. Califica el contenido de 0 a 100. "
+            "Categorias: Titulo /20, Densidad keyword /15, Estructura /20, "
+            "Longitud /15, Readability /15, Links /15. "
+            "Da un score total y 5 recomendaciones accionables."
+        )},
+        {"role": "user", "content": (
+            f"Keyword: {body.target_keyword}\n"
+            f"Palabras: {word_count}\n"
+            f"Densidad: {density:.1f}%\n"
+            f"Contenido:\n{body.content[:3000]}"
+        )},
+    ])
+    return {
+        "tenant_id": x_tenant_id,
+        "quick_stats": {
+            "word_count": word_count,
+            "keyword_count": keyword_count,
+            "keyword_density_pct": round(density, 1),
+        },
+        "analysis": result,
+    }
+
+
+# ──────────────────────────── Plagiarism Check ────────────────────────────
+
+class PlagiarismRequest(BaseModel):
+    content: str = Field(..., min_length=20)
+    content_type: str = Field("ad_copy", pattern="^(ad_copy|blog_post|email|social_post)$")
+
+
+@app.post("/api/v1/content/plagiarism-check", tags=["Content Quality"])
+async def plagiarism_check(
+    body: PlagiarismRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Verifica originalidad del contenido buscando frases en web."""
+    from adapters.search.tavily_adapter import TavilyAdapter
+
+    sentences = [s.strip() for s in body.content.replace("\n", ". ").split(". ") if len(s.strip()) > 20]
+    check_sentences = sentences[:5]
+
+    tavily: TavilyAdapter = _services.get("doc")
+    try:
+        from api.factory import _cache as factory_cache
+        adapters = factory_cache.get("adapters", {})
+        tavily_adapter = adapters.get("tavily")
+    except Exception:
+        tavily_adapter = None
+
+    matches = []
+    if tavily_adapter and tavily_adapter._api_key:
+        for sentence in check_sentences[:3]:
+            try:
+                results = tavily_adapter.search(f'"{sentence}"')
+                if results and "no results" not in results.lower() and "no encontr" not in results.lower():
+                    matches.append({"sentence": sentence[:100], "found": True, "preview": results[:200]})
+                else:
+                    matches.append({"sentence": sentence[:100], "found": False})
+            except Exception:
+                matches.append({"sentence": sentence[:100], "found": False, "error": "search_failed"})
+    else:
+        matches = [{"sentence": s[:100], "found": False, "note": "Web search not configured"} for s in check_sentences]
+
+    found_count = sum(1 for m in matches if m.get("found"))
+    total_checked = len(matches)
+    originality = round((1 - found_count / max(total_checked, 1)) * 100)
+
+    return {
+        "tenant_id": x_tenant_id,
+        "content_type": body.content_type,
+        "sentences_checked": total_checked,
+        "potential_matches": found_count,
+        "originality_score": originality,
+        "risk_level": "alto" if found_count >= 2 else ("medio" if found_count == 1 else "bajo"),
+        "details": matches,
+    }
+
+
 # ──────────────────────────── Guardrails ────────────────────────────
 
 class GuardrailCheckRequest(BaseModel):
@@ -942,3 +1150,23 @@ async def get_analytics(
     if not tracer:
         return {"error": "Tracer not initialized"}
     return {"tenant_id": x_tenant_id, **tracer.get_analytics(x_tenant_id)}
+
+
+# ──────────────────────────── Rate Limiting ────────────────────────────
+
+@app.get("/api/v1/rate-limit/usage", tags=["Rate Limiting"])
+async def rate_limit_usage(x_tenant_id: str = Header("default", alias="X-Tenant-ID")):
+    """Muestra el uso actual del tenant vs sus limites."""
+    return get_rate_limiter().get_usage(x_tenant_id)
+
+
+class SetTierRequest(BaseModel):
+    tenant_id: str
+    tier: str = Field(..., pattern="^(free|pro|enterprise)$")
+
+
+@app.post("/api/v1/rate-limit/set-tier", tags=["Rate Limiting"])
+async def set_tenant_tier(body: SetTierRequest):
+    """NestJS llama esto cuando un tenant cambia de plan."""
+    get_rate_limiter().set_tenant_tier(body.tenant_id, body.tier)
+    return {"tenant_id": body.tenant_id, "tier": body.tier, "message": "Tier updated"}
