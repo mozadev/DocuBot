@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import tempfile
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -531,3 +531,293 @@ async def get_brand_memory(x_tenant_id: str = Header("default", alias="X-Tenant-
     if not memory:
         return {"tenant_id": x_tenant_id, "brand": None, "message": "Sin brand memory configurada"}
     return {"tenant_id": x_tenant_id, "brand": memory.to_dict()}
+
+
+# ──────────────────────────── Templates ────────────────────────────
+
+@app.get("/api/v1/marketing/templates", tags=["Templates"])
+async def list_campaign_templates():
+    """Lista todos los templates de campana disponibles por industria."""
+    from domain.templates import list_templates
+    return {"templates": list_templates()}
+
+
+@app.get("/api/v1/marketing/templates/{template_id}", tags=["Templates"])
+async def get_campaign_template(template_id: str):
+    """Obtiene un template completo con todos los detalles."""
+    from domain.templates import get_template
+    template = get_template(template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail=f"Template '{template_id}' no encontrado")
+    return {"template": template.to_dict()}
+
+
+class TemplatedCampaignRequest(BaseModel):
+    template_id: str = Field(..., description="ID del template (restaurant, gym_fitness, etc.)")
+    business_description: str = Field(..., min_length=10)
+    target_audience: str = ""
+    budget_range: str = ""
+    goals: str = ""
+    language: str = "es"
+    business_context: Optional[BusinessContextSchema] = None
+
+
+@app.post("/api/v1/marketing/campaign-from-template", tags=["Templates"])
+async def generate_campaign_from_template(
+    body: TemplatedCampaignRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Genera una campana basada en un template de industria + datos reales del tenant."""
+    from domain.templates import get_template
+    template = get_template(body.template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail=f"Template '{body.template_id}' no encontrado")
+
+    mkt_svc = _services["mkt"]
+    enhanced_description = (
+        f"{body.business_description}\n\n"
+        f"USA ESTE TEMPLATE COMO BASE:\n{template.to_agent_prompt()}"
+    )
+
+    request = CampaignRequest(
+        tenant_id=x_tenant_id,
+        business_description=enhanced_description,
+        target_audience=body.target_audience or template.audience_hints,
+        channels=template.suggested_channels,
+        budget_range=body.budget_range or template.suggested_budget_range,
+        goals=body.goals or template.suggested_objective,
+        tone=template.tone,
+        language=body.language,
+        business_context=_schema_to_business_context(body.business_context),
+    )
+
+    campaign = mkt_svc.generate_campaign(request)
+    return {
+        "tenant_id": x_tenant_id,
+        "template_used": template.id,
+        "data_driven": request.business_context is not None,
+        "campaign": campaign.to_dict(),
+    }
+
+
+# ──────────────────────────── Personas ────────────────────────────
+
+class PersonaSchema(BaseModel):
+    name: str = Field(..., description="Nombre del avatar, ej: 'Maria Fitness'")
+    age_range: str = Field(..., description="Ej: '25-35'")
+    gender: str = Field(..., description="Ej: 'Mujer'")
+    location: str = ""
+    occupation: str = ""
+    income_level: str = ""
+    interests: List[str] = Field(default_factory=list)
+    pain_points: List[str] = Field(default_factory=list)
+    goals: List[str] = Field(default_factory=list)
+    preferred_channels: List[str] = Field(default_factory=list)
+    buying_behavior: str = ""
+    objections: List[str] = Field(default_factory=list)
+
+class PersonaCampaignRequest(BaseModel):
+    persona: PersonaSchema
+    business_description: str = Field(..., min_length=10)
+    channels: List[str] = Field(default=["instagram", "facebook"])
+    budget_range: str = ""
+    goals: str = ""
+    tone: str = "profesional"
+    language: str = "es"
+    business_context: Optional[BusinessContextSchema] = None
+
+
+@app.post("/api/v1/marketing/campaign-for-persona", tags=["Personas"])
+async def generate_campaign_for_persona(
+    body: PersonaCampaignRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Genera una campana personalizada para un avatar/persona especifico."""
+    from domain.personas import CustomerPersona
+
+    persona = CustomerPersona(
+        id=body.persona.name.lower().replace(" ", "_"),
+        name=body.persona.name,
+        age_range=body.persona.age_range,
+        gender=body.persona.gender,
+        location=body.persona.location,
+        occupation=body.persona.occupation,
+        income_level=body.persona.income_level,
+        interests=body.persona.interests,
+        pain_points=body.persona.pain_points,
+        goals=body.persona.goals,
+        preferred_channels=body.persona.preferred_channels,
+        buying_behavior=body.persona.buying_behavior,
+        objections=body.persona.objections,
+    )
+
+    mkt_svc = _services["mkt"]
+    enhanced_description = (
+        f"{body.business_description}\n\n"
+        f"GENERA CONTENIDO PARA ESTA PERSONA:\n{persona.to_agent_prompt()}"
+    )
+
+    request = CampaignRequest(
+        tenant_id=x_tenant_id,
+        business_description=enhanced_description,
+        target_audience=f"{persona.name}: {persona.gender} {persona.age_range}, {persona.location}",
+        channels=body.channels,
+        budget_range=body.budget_range,
+        goals=body.goals,
+        tone=body.tone,
+        language=body.language,
+        business_context=_schema_to_business_context(body.business_context),
+    )
+
+    campaign = mkt_svc.generate_campaign(request)
+    return {
+        "tenant_id": x_tenant_id,
+        "persona": persona.to_dict(),
+        "campaign": campaign.to_dict(),
+    }
+
+
+# ──────────────────────────── Performance Learning ────────────────────────────
+
+class PerformanceFeedbackSchema(BaseModel):
+    campaign_id: str
+    ad_title: str = ""
+    channel: str = ""
+    impressions: int = 0
+    clicks: int = 0
+    ctr: float = 0.0
+    cpc: float = 0.0
+    conversions: int = 0
+    cost_per_conversion: float = 0.0
+    spend: float = 0.0
+    roas: float = 0.0
+    engagement_rate: float = 0.0
+    whatsapp_messages: int = 0
+    best_audience_segment: str = ""
+    best_time_of_day: str = ""
+    notes: str = ""
+    currency: str = "USD"
+
+class OptimizationRequest(BaseModel):
+    performance_history: List[PerformanceFeedbackSchema]
+    business_description: str = Field(..., min_length=10)
+    what_to_improve: str = Field("CTR", description="KPI a mejorar: CTR, CPC, conversions, ROAS")
+    business_context: Optional[BusinessContextSchema] = None
+
+
+_performance_history: Dict[str, list] = {}
+
+
+@app.post("/api/v1/marketing/performance-feedback", tags=["Performance"])
+async def submit_performance_feedback(
+    body: List[PerformanceFeedbackSchema],
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """NestJS envia resultados de Meta Ads. DocuBot aprende para futuras campanas."""
+    from domain.personas import PerformanceFeedback
+
+    feedbacks = []
+    for fb in body:
+        pf = PerformanceFeedback(
+            campaign_id=fb.campaign_id, ad_title=fb.ad_title, channel=fb.channel,
+            impressions=fb.impressions, clicks=fb.clicks, ctr=fb.ctr, cpc=fb.cpc,
+            conversions=fb.conversions, cost_per_conversion=fb.cost_per_conversion,
+            spend=fb.spend, roas=fb.roas, engagement_rate=fb.engagement_rate,
+            whatsapp_messages=fb.whatsapp_messages,
+            best_audience_segment=fb.best_audience_segment,
+            best_time_of_day=fb.best_time_of_day, notes=fb.notes, currency=fb.currency,
+        )
+        feedbacks.append(pf)
+
+    if x_tenant_id not in _performance_history:
+        _performance_history[x_tenant_id] = []
+    _performance_history[x_tenant_id].extend(feedbacks)
+
+    return {
+        "tenant_id": x_tenant_id,
+        "feedbacks_received": len(feedbacks),
+        "total_history": len(_performance_history[x_tenant_id]),
+        "message": "Performance feedback guardado. Se usara en futuras campanas.",
+    }
+
+
+@app.post("/api/v1/marketing/optimize", tags=["Performance"])
+async def suggest_campaign_optimization(
+    body: OptimizationRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Analiza rendimiento y sugiere optimizaciones basadas en datos reales."""
+    from domain.personas import PerformanceFeedback
+
+    perf_text = "\n\n".join(
+        PerformanceFeedback(
+            campaign_id=fb.campaign_id, ad_title=fb.ad_title, channel=fb.channel,
+            impressions=fb.impressions, clicks=fb.clicks, ctr=fb.ctr, cpc=fb.cpc,
+            conversions=fb.conversions, cost_per_conversion=fb.cost_per_conversion,
+            spend=fb.spend, roas=fb.roas, engagement_rate=fb.engagement_rate,
+            whatsapp_messages=fb.whatsapp_messages,
+            best_audience_segment=fb.best_audience_segment,
+            best_time_of_day=fb.best_time_of_day, notes=fb.notes, currency=fb.currency,
+        ).to_agent_prompt()
+        for fb in body.performance_history
+    )
+
+    mkt_svc = _services["mkt"]
+    biz_ctx = _schema_to_business_context(body.business_context)
+    analysis = mkt_svc.analyze_market(
+        f"Optimiza la siguiente campana para mejorar {body.what_to_improve}:\n\n"
+        f"Negocio: {body.business_description}\n\n"
+        f"RENDIMIENTO ACTUAL:\n{perf_text}\n\n"
+        f"Genera recomendaciones concretas y accionables.",
+        business_context=biz_ctx,
+    )
+
+    return {
+        "tenant_id": x_tenant_id,
+        "kpi_to_improve": body.what_to_improve,
+        "optimization_suggestions": analysis,
+    }
+
+
+# ──────────────────────────── Multi-idioma ────────────────────────────
+
+class TranslateRequest(BaseModel):
+    content: str = Field(..., min_length=10)
+    target_languages: List[str] = Field(..., description="Codigos de idioma: en, pt, fr, de, it, etc.")
+    adapt_culturally: bool = Field(True, description="Adaptar culturalmente vs traduccion literal")
+
+
+@app.post("/api/v1/marketing/translate", tags=["Multi-idioma"])
+async def translate_content(
+    body: TranslateRequest,
+    x_tenant_id: str = Header("default", alias="X-Tenant-ID"),
+):
+    """Traduce y adapta culturalmente contenido de marketing a multiples idiomas."""
+    mkt_svc = _services["mkt"]
+    translations = {}
+
+    lang_names = {
+        "en": "Ingles (USA)", "pt": "Portugues (Brasil)", "fr": "Frances",
+        "de": "Aleman", "it": "Italiano", "ja": "Japones", "zh": "Chino Mandarín",
+        "ko": "Coreano", "ar": "Arabe", "hi": "Hindi",
+    }
+
+    for lang in body.target_languages:
+        lang_name = lang_names.get(lang, lang)
+        adapt = "adaptacion cultural completa" if body.adapt_culturally else "traduccion literal"
+
+        result = mkt_svc._llm.invoke([
+            {"role": "system", "content": (
+                f"Eres un traductor experto en marketing. Traduce al {lang_name} con {adapt}. "
+                f"Adapta modismos, hashtags y CTAs al mercado del idioma destino. "
+                f"Responde SOLO con la traduccion, sin explicaciones."
+            )},
+            {"role": "user", "content": body.content},
+        ])
+        translations[lang] = {"language": lang_name, "content": result}
+
+    return {
+        "tenant_id": x_tenant_id,
+        "original_language": "es",
+        "translations": translations,
+    }
