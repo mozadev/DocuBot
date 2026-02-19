@@ -11,7 +11,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from core.logger import logger
-from agents.tools import build_tools
+from agents.chat_tools import build_tools
 
 
 class AgentState(TypedDict):
