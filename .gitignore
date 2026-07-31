@@ -136,6 +136,14 @@ logs/
 # Data directories (keep structure but not content)
 data/vector_db/*
 !data/vector_db/.gitkeep
+
+# Figures extracted from uploaded PDFs. These are user content -- an uploaded
+# document's images must never reach the repository.
+data/images/*
+!data/images/.gitkeep
+
+# Uploaded documents, if anyone drops one here.
+data/uploads/
 data/sample_documents/*
 !data/sample_documents/.gitkeep
 
