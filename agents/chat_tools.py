@@ -1,109 +1,97 @@
-"""Herramientas del agente LangGraph para DocuBot AI."""
+"""Tools exposed to the LangGraph agent."""
 
 from __future__ import annotations
 
-from typing import List
+from collections.abc import Callable
 
 from langchain_core.tools import tool
 
 from core.logger import logger
 
+# Retrieval depth. 4 chunks at ~1000 chars each keeps the prompt well inside the
+# context window while giving the model enough material to cross-reference two
+# or three passages. Raising it mostly adds noise; see README for the trade-off.
+DEFAULT_K = 4
 
-def build_tools(vector_store) -> list:
-    """Construye herramientas internas inyectando el vector store."""
+# How much of each chunk to show the model. The full chunk is ~1000 chars, and
+# truncating below that loses the tail of a passage mid-sentence.
+SNIPPET_CHARS = 1000
+
+
+def format_results(results: list) -> str:
+    """
+    Render retrieved chunks for the model.
+
+    The header is parsed back out in agents/graph.py to build citations, so the
+    field order here and the parser there are one contract. Keeping page numbers
+    in the header is what lets a user jump to the page an answer came from.
+    """
+    blocks = []
+    for i, sr in enumerate(results, 1):
+        label = "IMAGE" if sr.chunk.is_image else "TEXT"
+        page = sr.chunk.metadata.get("page_number", 0) or 0
+        blocks.append(
+            f"[Source {i} | {label} | {sr.chunk.filename} | page={page} | score={sr.score:.3f}]\n"
+            f"{sr.chunk.content[:SNIPPET_CHARS]}"
+        )
+    return "\n\n---\n\n".join(blocks)
+
+
+def build_tools(vector_store, on_retrieval: Callable | None = None) -> list:
+    """
+    Build the agent's tools with the vector store injected.
+
+    on_retrieval is an optional callback invoked with (query, results) after each
+    search. The graph uses it to record retrieval spans, so the tools themselves
+    never need to know that a tracer exists.
+    """
+
+    def _search(query: str, k: int) -> list:
+        results = vector_store.similarity_search(query, k=k)
+        if on_retrieval:
+            on_retrieval(query, results)
+        return results
 
     @tool
     def search_documents(query: str) -> str:
-        """Busca información relevante en los documentos indexados.
-        Usa esta herramienta cuando el usuario pregunte sobre contenido de documentos."""
+        """Search the indexed documents for passages relevant to a query.
+
+        Use this for any question about document content. Pass a focused query
+        describing the information you need, not the user's full sentence."""
         try:
-            results = vector_store.similarity_search(query, k=4)
+            results = _search(query, DEFAULT_K)
             if not results:
-                return "No se encontraron documentos relevantes para esta consulta."
-            parts: List[str] = []
-            for i, sr in enumerate(results, 1):
-                label = "IMAGEN" if sr.chunk.is_image else "TEXTO"
-                parts.append(
-                    f"[Fuente {i} | {label} | {sr.chunk.filename} | score={sr.score:.3f}]\n"
-                    f"{sr.chunk.content[:500]}"
-                )
-            return "\n\n---\n\n".join(parts)
-        except Exception as e:
-            logger.error(f"Error en search_documents: {e}")
-            return f"Error buscando documentos: {e}"
+                return "NO_RESULTS: no indexed document matched this query."
+            return format_results(results)
+        except Exception as e:  # noqa: BLE001 - surfaced to the model as text
+            logger.error("search_documents failed: %s", e)
+            return f"ERROR: document search failed ({e})."
 
     @tool
     def get_document_stats() -> str:
-        """Devuelve estadísticas sobre los documentos indexados.
-        Usa esta herramienta cuando el usuario pregunte cuántos documentos hay."""
+        """Report how many chunks are currently indexed.
+
+        Use this when the user asks what documents are loaded or whether the
+        knowledge base is empty."""
         try:
             count = vector_store.get_document_count()
-            return (
-                f"Base de datos vectorial:\n"
-                f"- Chunks indexados: {count}\n"
-                f"- Estado: {'Activa' if count > 0 else 'Vacía'}"
-            )
-        except Exception as e:
-            return f"Error: {e}"
+            state = "active" if count > 0 else "empty"
+            return f"Vector store: {count} chunks indexed, status {state}."
+        except Exception as e:  # noqa: BLE001
+            return f"ERROR: {e}"
 
     @tool
     def summarize_topic(topic: str) -> str:
-        """Resume información sobre un tema en los documentos indexados.
-        Usa esta herramienta cuando el usuario pida un resumen sobre un tema."""
+        """Gather broader context about a topic across the document collection.
+
+        Use this instead of search_documents when the user asks for a summary or
+        an overview, since it retrieves more passages."""
         try:
-            results = vector_store.similarity_search(topic, k=6)
+            results = _search(topic, 6)
             if not results:
-                return f"No se encontró información sobre '{topic}'."
-            combined = "\n\n".join(sr.chunk.content[:400] for sr in results)
-            return f"Información sobre '{topic}' ({len(results)} fuentes):\n\n{combined}"
-        except Exception as e:
-            return f"Error: {e}"
+                return f"NO_RESULTS: nothing indexed about '{topic}'."
+            return f"{len(results)} passages about '{topic}':\n\n" + format_results(results)
+        except Exception as e:  # noqa: BLE001
+            return f"ERROR: {e}"
 
-    @tool
-    def suggest_marketing_content(product_or_service: str) -> str:
-        """Busca información del producto/servicio en los documentos para sugerir contenido de marketing.
-        Usa esta herramienta cuando el usuario pida ayuda con marketing, publicidad o campañas."""
-        try:
-            results = vector_store.similarity_search(product_or_service, k=6)
-            if not results:
-                return f"No se encontró información sobre '{product_or_service}' para generar contenido de marketing."
-            context = "\n\n".join(
-                f"- [{sr.chunk.filename}]: {sr.chunk.content[:300]}"
-                for sr in results
-            )
-            return (
-                f"Información disponible sobre '{product_or_service}' para marketing "
-                f"({len(results)} fuentes):\n\n{context}\n\n"
-                "Usa esta información para generar contenido de marketing relevante."
-            )
-        except Exception as e:
-            return f"Error: {e}"
-
-    @tool
-    def get_product_catalog() -> str:
-        """Obtiene un resumen del catálogo de productos/servicios disponibles en los documentos.
-        Usa cuando necesites saber qué productos/servicios tiene el negocio."""
-        try:
-            queries = ["productos", "servicios", "precios", "catálogo", "oferta"]
-            all_content: List[str] = []
-            seen_files = set()
-            for q in queries:
-                results = vector_store.similarity_search(q, k=3)
-                for sr in results:
-                    key = f"{sr.chunk.filename}:{sr.chunk.content[:50]}"
-                    if key not in seen_files:
-                        seen_files.add(key)
-                        all_content.append(f"[{sr.chunk.filename}]: {sr.chunk.content[:300]}")
-            if not all_content:
-                return "No se encontró información de productos o servicios en los documentos."
-            return f"Catálogo encontrado ({len(all_content)} items):\n\n" + "\n\n".join(all_content)
-        except Exception as e:
-            return f"Error: {e}"
-
-    return [
-        search_documents,
-        get_document_stats,
-        summarize_topic,
-        suggest_marketing_content,
-        get_product_catalog,
-    ]
+    return [search_documents, get_document_stats, summarize_topic]

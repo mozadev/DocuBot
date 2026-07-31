@@ -1,168 +1,175 @@
 """
-Guardrails: validacion de seguridad de marca y contenido.
-Previene que el agente genere contenido inapropiado, off-brand, o peligroso.
-Se ejecuta ANTES de entregar contenido al tenant.
+Guardrails for the RAG pipeline.
+
+Two checkpoints, because input risk and output risk are different problems:
+
+  check_input(question)   - runs before we spend a single token. Blocks prompt
+                            injection and oversized input.
+  check_output(answer, sources)
+                          - runs before the answer reaches the user. Catches the
+                            failure mode that actually matters in RAG: an answer
+                            that sounds confident but is not supported by any
+                            retrieved chunk.
+
+Deliberately rule-based rather than an LLM judge. A judge would catch more, but
+it doubles latency and cost on every turn and can itself be talked out of a
+verdict. Rules are cheap, deterministic and testable; the LLM-judge upgrade is
+noted in the README as future work.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 from core.logger import logger
+
+# Attempts to override the system prompt or exfiltrate it. These are matched
+# against the user's question only, never against document content -- documents
+# are data, and a PDF that happens to contain the words "ignore previous
+# instructions" is not an attack on us.
+INJECTION_PATTERNS: list[tuple[str, str]] = [
+    (r"ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)", "instruction override"),
+    (r"disregard\s+(all\s+)?(previous|prior|above|your)\s+", "instruction override"),
+    (r"(reveal|show|print|repeat|output)\s+(me\s+)?(your|the)\s+(system\s+)?(prompt|instructions)", "prompt exfiltration"),
+    (r"you\s+are\s+now\s+(a|an)\s+", "role reassignment"),
+    (r"forget\s+(everything|all)\s+(you|above)", "instruction override"),
+    (r"</?(system|assistant)>", "role tag injection"),
+]
+
+# Patterns redacted from the answer. Documents legitimately contain contact
+# details, but echoing a credential back into a chat transcript is never useful.
+PII_PATTERNS: list[tuple[str, str]] = [
+    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[email redacted]"),
+    (r"\b(?:\d[ -]*?){13,16}\b", "[card number redacted]"),
+    (r"\b(sk|pk)-[A-Za-z0-9]{20,}\b", "[api key redacted]"),
+]
+
+MAX_QUESTION_CHARS = 2000
+
+# Below this retrieval score the context is too weak to treat the answer as
+# grounded. Tuned against text-embedding-3-small cosine scores, where a genuine
+# topical match typically lands above ~0.3 and noise below it.
+MIN_GROUNDING_SCORE = 0.25
 
 
 @dataclass
 class GuardrailResult:
-    """Resultado de la validacion de guardrails."""
-    passed: bool
-    violations: List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
-    sanitized_content: str = ""
-    risk_score: float = 0.0  # 0.0 = safe, 1.0 = blocked
+    """Outcome of a guardrail checkpoint."""
 
-    def to_dict(self) -> Dict[str, Any]:
+    passed: bool
+    violations: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    content: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "violations": self.violations,
             "warnings": self.warnings,
-            "risk_score": self.risk_score,
         }
 
 
-# Palabras/frases que siempre deben ser bloqueadas en contenido de marketing
-BLOCKED_PATTERNS = [
-    r"\b(garantizado|100%\s*seguro|cura\s+definitiva|milagro)\b",
-    r"\b(gratis|free)\b.*\b(sin\s+condiciones|sin\s+letra\s+chica)\b",
-    r"\b(bitcoin|crypto|forex|trading)\b.*\b(ganancias|profit|rendimiento)\b",
-    r"\b(adelgaza|baja\s+de\s+peso)\b.*\b(sin\s+esfuerzo|sin\s+dieta|rapido)\b",
-    r"\b(hack|exploit|pirate)\b",
-]
-
-# Patrones que generan advertencia pero no bloqueo
-WARNING_PATTERNS = [
-    (r"\b(mejor|number\s*one|#1|numero\s*1|lider)\b", "Claim de superioridad puede requerir sustento legal"),
-    (r"\b(oferta|descuento|promo)\b.*\b(tiempo\s+limitado|ultimas?\s+unidades?|se\s+acaba)\b",
-     "Urgencia artificial — verificar que sea real"),
-    (r"\b(doctor|medico|salud|tratamiento)\b", "Contenido de salud requiere disclaimers legales"),
-    (r"\b(inversion|rendimiento|ganancias)\b", "Contenido financiero requiere disclaimers legales"),
-]
-
-# Requisitos legales por tipo de contenido
-LEGAL_REQUIREMENTS = {
-    "health": "Incluir: 'Consulte a su medico'. No prometer curas.",
-    "finance": "Incluir: 'Rendimientos pasados no garantizan resultados futuros'.",
-    "food": "Si menciona propiedades saludables, debe tener sustento.",
-    "alcohol": "Incluir: 'El abuso del alcohol es danino'. Solo mayores de edad.",
-    "supplements": "Incluir: 'Este producto no es un medicamento'.",
-}
-
-
-class ContentGuardrails:
-    """Valida contenido de marketing contra reglas de seguridad de marca."""
+class RagGuardrails:
+    """Input and output validation for document question-answering."""
 
     def __init__(
         self,
-        brand_never_include: Optional[List[str]] = None,
-        industry: str = "",
-        strict_mode: bool = False,
+        min_grounding_score: float = MIN_GROUNDING_SCORE,
+        max_question_chars: int = MAX_QUESTION_CHARS,
+        redact_pii: bool = True,
     ) -> None:
-        self._brand_blocked = [p.lower() for p in (brand_never_include or [])]
-        self._industry = industry.lower()
-        self._strict = strict_mode
+        self._min_score = min_grounding_score
+        self._max_chars = max_question_chars
+        self._redact_pii = redact_pii
 
-    def validate(self, content: str) -> GuardrailResult:
-        """Ejecuta todas las validaciones sobre el contenido."""
-        violations: List[str] = []
-        warnings: List[str] = []
+    def check_input(self, question: str) -> GuardrailResult:
+        """Validate a user question before it reaches the LLM."""
+        violations: list[str] = []
 
-        content_lower = content.lower()
+        if not question or not question.strip():
+            return GuardrailResult(passed=False, violations=["Question is empty."], content="")
 
-        for pattern in BLOCKED_PATTERNS:
-            if re.search(pattern, content_lower, re.IGNORECASE):
-                violations.append(f"Contenido bloqueado: patron '{pattern}' detectado")
+        if len(question) > self._max_chars:
+            violations.append(
+                f"Question exceeds {self._max_chars} characters ({len(question)}). "
+                "Split it into smaller questions."
+            )
 
-        for pattern, warning_msg in WARNING_PATTERNS:
-            if re.search(pattern, content_lower, re.IGNORECASE):
-                warnings.append(warning_msg)
-
-        for blocked_word in self._brand_blocked:
-            if blocked_word.lower() in content_lower:
-                violations.append(f"Palabra prohibida por la marca: '{blocked_word}'")
-
-        for industry_key, disclaimer in LEGAL_REQUIREMENTS.items():
-            if industry_key in self._industry or industry_key in content_lower:
-                if not any(d_word in content_lower for d_word in ["consulte", "disclaimer", "condiciones"]):
-                    warnings.append(f"Posible requisito legal: {disclaimer}")
-
-        if len(content) > 5000:
-            warnings.append("Contenido muy largo (>5000 chars). Considerar acortar.")
-
-        if self._has_excessive_caps(content):
-            warnings.append("Uso excesivo de mayusculas. Puede parecer spam.")
-
-        if self._has_excessive_emojis(content):
-            warnings.append("Demasiados emojis. Puede reducir credibilidad.")
-
-        risk_score = self._calculate_risk(violations, warnings)
-        passed = len(violations) == 0 and (not self._strict or len(warnings) == 0)
-
-        if violations:
-            logger.warning(f"Guardrails: {len(violations)} violaciones en contenido")
+        for pattern, label in INJECTION_PATTERNS:
+            if re.search(pattern, question, re.IGNORECASE):
+                violations.append(f"Possible prompt injection detected ({label}).")
+                logger.warning("Guardrail blocked input: %s", label)
+                break
 
         return GuardrailResult(
-            passed=passed,
+            passed=not violations,
             violations=violations,
-            warnings=warnings,
-            sanitized_content=content if passed else "",
-            risk_score=risk_score,
+            content=question.strip(),
         )
 
-    def validate_campaign(self, campaign_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Valida una campana completa (strategy + content pieces)."""
-        results = {"overall_passed": True, "pieces": []}
+    def check_output(self, answer: str, sources: Sequence[Any]) -> GuardrailResult:
+        """
+        Validate a generated answer before returning it.
 
-        strategy = campaign_dict.get("strategy_summary", "")
-        if strategy:
-            sr = self.validate(strategy)
-            if not sr.passed:
-                results["overall_passed"] = False
-            results["strategy_check"] = sr.to_dict()
+        The important check is grounding: if retrieval returned nothing useful
+        but the model still produced a confident-looking answer, that answer is
+        coming from parametric memory rather than the user's documents. In a
+        "chat with your docs" product that is a wrong answer even when the fact
+        it states happens to be true.
+        """
+        violations: list[str] = []
+        warnings: list[str] = []
+        content = answer or ""
 
-        for i, piece in enumerate(campaign_dict.get("content_pieces", [])):
-            body = piece.get("body", "")
-            title = piece.get("title", "")
-            full_content = f"{title}\n{body}"
+        if not content.strip():
+            return GuardrailResult(
+                passed=False, violations=["Model returned an empty answer."], content=""
+            )
 
-            pr = self.validate(full_content)
-            if not pr.passed:
-                results["overall_passed"] = False
+        best_score = max((getattr(s, "score", 0.0) for s in sources), default=0.0)
 
-            results["pieces"].append({
-                "index": i,
-                "channel": piece.get("channel", ""),
-                "title": title[:50],
-                **pr.to_dict(),
-            })
+        if not sources:
+            if not self._is_refusal(content):
+                violations.append(
+                    "Answer is not grounded: no documents were retrieved, but the "
+                    "model answered anyway."
+                )
+        elif best_score < self._min_score:
+            warnings.append(
+                f"Weak grounding: best retrieval score {best_score:.3f} is below "
+                f"{self._min_score}. Treat this answer as low confidence."
+            )
 
-        return results
+        if self._redact_pii:
+            content, redacted = self._redact(content)
+            if redacted:
+                warnings.append(f"Redacted {redacted} sensitive value(s) from the answer.")
+
+        return GuardrailResult(
+            passed=not violations,
+            violations=violations,
+            warnings=warnings,
+            content=content,
+        )
 
     @staticmethod
-    def _has_excessive_caps(text: str) -> bool:
-        words = text.split()
-        if len(words) < 5:
-            return False
-        caps_words = sum(1 for w in words if w.isupper() and len(w) > 2)
-        return caps_words / len(words) > 0.3
+    def _is_refusal(answer: str) -> bool:
+        """True if the model correctly said it could not find the information."""
+        markers = [
+            "don't have", "do not have", "couldn't find", "could not find",
+            "no information", "not found", "isn't in", "is not in",
+            "no relevant", "unable to find", "not covered", "cannot answer",
+        ]
+        lowered = answer.lower()
+        return any(m in lowered for m in markers)
 
     @staticmethod
-    def _has_excessive_emojis(text: str) -> bool:
-        emoji_count = sum(1 for c in text if ord(c) > 0x1F600)
-        word_count = max(len(text.split()), 1)
-        return emoji_count / word_count > 0.15
-
-    @staticmethod
-    def _calculate_risk(violations: List[str], warnings: List[str]) -> float:
-        score = len(violations) * 0.4 + len(warnings) * 0.1
-        return min(score, 1.0)
+    def _redact(text: str) -> tuple[str, int]:
+        count = 0
+        for pattern, replacement in PII_PATTERNS:
+            text, n = re.subn(pattern, replacement, text)
+            count += n
+        return text, count

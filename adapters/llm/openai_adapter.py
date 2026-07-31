@@ -1,74 +1,92 @@
-"""Adapter: implementación de LLMPort con OpenAI."""
+"""Adapter: LLMPort backed by OpenAI (chat + vision)."""
 
 from __future__ import annotations
 
 import base64
 from pathlib import Path
-from typing import List, Dict
 
-from openai import OpenAI
 from langchain_openai import ChatOpenAI
+from openai import OpenAI
 
 from core.logger import logger
 
+VISION_SYSTEM_PROMPT = (
+    "You describe figures extracted from documents so they can be retrieved by "
+    "semantic search. Be specific and factual. For a chart, state the axes, the "
+    "series and the trend, and read off notable values. For a table, transcribe "
+    "the data. For a diagram, name the components and how they connect. Do not "
+    "speculate about anything the image does not show."
+)
+
 
 class OpenAIAdapter:
-    """LLM adapter para OpenAI (chat + vision)."""
+    """
+    OpenAI chat and vision.
 
-    def __init__(self, api_key: str, model: str, vision_model: str, temperature: float = 0.2) -> None:
+    Two models rather than one: gpt-4o-mini answers questions, and a stronger
+    vision model reads figures at ingest time. Ingest happens once per document
+    while answering happens on every turn, so paying more for accuracy at ingest
+    is the cheap side of the trade.
+    """
+
+    def __init__(
+        self, api_key: str, model: str, vision_model: str, temperature: float = 0.2
+    ) -> None:
         self._client = OpenAI(api_key=api_key)
         self._model = model
         self._vision_model = vision_model
         self._temperature = temperature
         self._api_key = api_key
 
-    def invoke(self, messages: List[Dict[str, str]]) -> str:
+    def invoke(self, messages: list[dict[str, str]]) -> str:
         response = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=self._temperature,
+            model=self._model, messages=messages, temperature=self._temperature
         )
-        return response.choices[0].message.content.strip()
+        return (response.choices[0].message.content or "").strip()
 
     def describe_image(self, image_path: str, context: str = "") -> str:
+        """Return a searchable description of an image, or a marker on failure."""
         try:
-            with open(image_path, "rb") as f:
-                image_data = base64.b64encode(f.read()).decode("utf-8")
-
+            image_data = base64.b64encode(Path(image_path).read_bytes()).decode("utf-8")
             ext = Path(image_path).suffix.lstrip(".").lower()
-            mime_map = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
-            mime_type = mime_map.get(ext, "image/png")
+            mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(
+                ext, "image/png"
+            )
 
             response = self._client.chat.completions.create(
                 model=self._vision_model,
                 messages=[
-                    {"role": "system", "content": (
-                        "Eres un experto en análisis de imágenes de documentos. "
-                        "Describe de forma detallada y estructurada el contenido. "
-                        "Si es gráfico: ejes, valores, tendencias. "
-                        "Si es tabla: extrae datos. Si es diagrama: componentes y relaciones. "
-                        "Responde en español."
-                    )},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": f"Describe esta imagen.{f' Contexto: {context}' if context else ''}"},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_data}", "detail": "high"}},
-                    ]},
+                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Describe this figure."
+                                + (f" Context: {context}" if context else ""),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime};base64,{image_data}",
+                                    "detail": "high",
+                                },
+                            },
+                        ],
+                    },
                 ],
                 max_tokens=1000,
                 temperature=0.2,
             )
-            description = response.choices[0].message.content.strip()
-            logger.info(f"Imagen descrita: {Path(image_path).name}")
-            return description
+            logger.info("Described figure: %s", Path(image_path).name)
+            return (response.choices[0].message.content or "").strip()
 
-        except Exception as e:
-            logger.error(f"Error describiendo imagen {image_path}: {e}")
-            return f"[Imagen no procesada: {Path(image_path).name}]"
+        except Exception as e:  # noqa: BLE001 - one bad figure must not fail the upload
+            logger.error("Vision description failed for %s: %s", image_path, e)
+            return f"[image not processed: {Path(image_path).name}]"
 
     def get_langchain_llm(self) -> ChatOpenAI:
-        """Retorna un ChatOpenAI para usar en cadenas LangChain/LangGraph."""
+        """A ChatOpenAI instance for use inside the LangGraph agent."""
         return ChatOpenAI(
-            model=self._model,
-            temperature=self._temperature,
-            api_key=self._api_key,
+            model=self._model, temperature=self._temperature, api_key=self._api_key
         )

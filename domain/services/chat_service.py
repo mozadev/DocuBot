@@ -1,158 +1,246 @@
-"""Servicio de dominio: chat con agente LangGraph + MCP."""
+"""
+Domain service: question answering over the indexed document collection.
+
+This is where the cross-cutting concerns are composed into one request path:
+
+    guardrail(in) -> cache lookup -> agent graph -> guardrail(out) -> cache store
+
+Each step opens a span on the tracer, so every answer is explainable after the
+fact: which tools ran, how long retrieval took, what the model cost, and whether
+a guardrail fired. Tracing lives here rather than in the API layer because the
+Streamlit UI calls the same service and should produce the same traces.
+"""
 
 from __future__ import annotations
 
-import asyncio
-from typing import List, Dict, Any, Optional
+from typing import Any
 
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
-from domain.models import ChatResponse, Source, ChatMessage, MCPStatus
-from core.logger import logger, log_function_call
+from adapters.observability.tracer import SpanType
+from core.logger import log_function_call, logger
+from domain.guardrails import RagGuardrails
+from domain.models import ChatMessage, ChatResponse, Source
 
-
-def _run_async(coro):
-    """Ejecuta una corrutina desde código síncrono."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            return pool.submit(asyncio.run, coro).result()
-    else:
-        return asyncio.run(coro)
+# How many prior turns to replay into the prompt. Full history would grow the
+# prompt without bound; 6 turns covers the follow-up questions users actually
+# ask ("what about the second one?") while keeping token cost flat.
+HISTORY_WINDOW = 6
 
 
 class ChatService:
-    """Orquesta preguntas, historial y resúmenes usando el agente LangGraph."""
+    """Answers questions about indexed documents, scoped per session."""
 
-    def __init__(self, vector_store, llm_adapter, mcp_manager, graph_builder, session_id: str = "default") -> None:
+    def __init__(
+        self,
+        vector_store,
+        llm_adapter,
+        graph_builder,
+        guardrails: RagGuardrails | None = None,
+        tracer=None,
+        cache=None,
+    ) -> None:
         self._vector_store = vector_store
         self._llm = llm_adapter
-        self._mcp_manager = mcp_manager
-        self._session_id = session_id
-        self._chat_history: Dict[str, List] = {}
+        self._guardrails = guardrails or RagGuardrails()
+        self._tracer = tracer
+        self._cache = cache
+        self._histories: dict[str, list] = {}
 
-        # Inicializar MCP
-        self._mcp_initialized = False
-        self._init_mcp()
-
-        # Construir grafo
+        # Retrieval spans are recorded through this callback, which the graph
+        # passes down to the search tools. _current_trace is set per request.
+        self._current_trace: str | None = None
         self._graph = graph_builder(
             vector_store=vector_store,
             llm_adapter=llm_adapter,
-            mcp_manager=mcp_manager,
+            on_retrieval=self._record_retrieval,
         )
-        logger.info("ChatService inicializado (LangGraph + MCP)")
+        logger.info("ChatService ready")
 
-    def _init_mcp(self) -> None:
-        try:
-            _run_async(self._mcp_manager.initialize())
-            self._mcp_initialized = True
-            tool_count = len(self._mcp_manager.tools)
-            if tool_count:
-                logger.info(f"MCP: {tool_count} herramientas externas cargadas")
-            else:
-                logger.info("MCP: sin servidores externos conectados")
-        except Exception as e:
-            logger.warning(f"MCP no pudo inicializarse: {e}")
+    @property
+    def graph(self):
+        """The compiled agent graph, exposed for the streaming endpoint."""
+        return self._graph
 
-    def _get_history(self, session_id: str) -> List:
-        if session_id not in self._chat_history:
-            self._chat_history[session_id] = []
-        return self._chat_history[session_id]
+    # ---- tracing helpers ----
+
+    def _record_retrieval(self, query: str, results: list) -> None:
+        if not self._tracer or not self._current_trace:
+            return
+        span = self._tracer.start_span(
+            self._current_trace,
+            name="vector_search",
+            span_type=SpanType.RETRIEVAL,
+            input_data={"query": query[:200]},
+        )
+        if span:
+            top = max((r.score for r in results), default=0.0)
+            self._tracer.finish_span(
+                span,
+                output={
+                    "results": len(results),
+                    "top_score": round(top, 4),
+                    "files": sorted({r.chunk.filename for r in results}),
+                },
+            )
+
+    def _span(self, name: str, span_type: SpanType, **input_data):
+        if not self._tracer or not self._current_trace:
+            return None
+        return self._tracer.start_span(
+            self._current_trace, name=name, span_type=span_type, input_data=input_data
+        )
+
+    def _finish(self, span, output: Any = None, error: str | None = None) -> None:
+        if span and self._tracer:
+            self._tracer.finish_span(span, output=output, error=error)
+
+    # ---- public API ----
 
     @log_function_call
-    def ask_question(self, question: str) -> ChatResponse:
-        if not question or not question.strip():
-            return ChatResponse(answer="Por favor, proporciona una pregunta válida.")
+    def ask_question(self, question: str, session_id: str = "default") -> ChatResponse:
+        """Answer one question within a session's conversation history."""
+        trace_id = ""
+        if self._tracer:
+            trace_id = self._tracer.start_trace(
+                tenant_id=session_id, session_type="chat", metadata={"question": question[:200]}
+            )
+        self._current_trace = trace_id
 
-        history = self._get_history(self._session_id)
-        messages = list(history) + [HumanMessage(content=question)]
+        try:
+            return self._ask(question, session_id, trace_id)
+        finally:
+            if self._tracer and trace_id:
+                self._tracer.finish_trace(trace_id)
+            self._current_trace = None
 
-        result = self._graph.invoke({
-            "messages": messages,
-            "sources": [],
-            "confidence": 0.0,
-            "route": "",
-        })
+    def _ask(self, question: str, session_id: str, trace_id: str) -> ChatResponse:
+        # 1. Input guardrail - cheapest possible rejection, before any token spend.
+        span = self._span("guardrail_input", SpanType.GUARDRAIL, question=question[:200])
+        check = self._guardrails.check_input(question)
+        self._finish(span, output=check.to_dict())
 
-        # Extraer respuesta del último mensaje AI
-        all_messages = result.get("messages", [])
-        answer_text = ""
-        for msg in reversed(all_messages):
-            if isinstance(msg, AIMessage) and msg.content and not getattr(msg, "tool_calls", None):
-                answer_text = msg.content
-                break
+        if not check.passed:
+            return ChatResponse(
+                answer="I can't process that request: " + " ".join(check.violations),
+                question=question,
+                trace_id=trace_id,
+                guardrail={"stage": "input", **check.to_dict()},
+            )
 
-        # Actualizar historial
-        history.append(HumanMessage(content=question))
-        if answer_text:
-            history.append(AIMessage(content=answer_text))
+        question = check.content
 
-        # Construir fuentes
-        raw_sources = result.get("sources", [])
-        sources = [Source(**s) if isinstance(s, dict) else s for s in raw_sources]
+        # 2. Cache lookup, scoped per session so one user's answers never leak
+        #    into another's.
+        if self._cache:
+            span = self._span("cache_lookup", SpanType.CACHE_LOOKUP, question=question[:200])
+            hit = self._cache.get(question, tenant_id=session_id)
+            self._finish(span, output={"hit": hit is not None})
+            if hit is not None:
+                cached = ChatResponse(**{**hit, "sources": [Source(**s) for s in hit["sources"]]})
+                cached.cached = True
+                cached.trace_id = trace_id
+                return cached
+
+        # 3. Run the agent.
+        history = self._histories.setdefault(session_id, [])
+        messages = history[-HISTORY_WINDOW * 2:] + [HumanMessage(content=question)]
+
+        span = self._span("agent_graph", SpanType.AGENT_STEP, turns=len(messages))
+        try:
+            result = self._graph.invoke(
+                {"messages": messages, "sources": [], "confidence": 0.0}
+            )
+        except Exception as e:  # noqa: BLE001 - one bad turn must not kill the session
+            logger.exception("Agent graph failed")
+            self._finish(span, error=str(e))
+            return ChatResponse(
+                answer="Something went wrong while answering. Please try again.",
+                question=question,
+                trace_id=trace_id,
+            )
+
+        answer_text = self._last_answer(result.get("messages", []))
+        sources = [Source(**s) for s in result.get("sources", [])]
         confidence = result.get("confidence", 0.0)
+        self._finish(
+            span, output={"answer_chars": len(answer_text), "sources": len(sources)}
+        )
 
-        # Fallback si no se extrajeron fuentes
-        if not sources and answer_text:
-            try:
-                scored = self._vector_store.similarity_search(question, k=4)
-                for sr in scored:
-                    src = Source(
-                        filename=sr.chunk.filename,
-                        content=(sr.chunk.content[:200] + "...") if sr.chunk.content else "",
-                        score=sr.score,
-                        content_type=sr.chunk.content_type,
-                        image_path=sr.chunk.metadata.get("image_path", ""),
-                        page_number=sr.chunk.metadata.get("page_number", 0),
-                    )
-                    sources.append(src)
-                if sources:
-                    confidence = sum(s.score for s in sources) / len(sources)
-            except Exception:
-                pass
+        # 4. Output guardrail - the grounding check that makes this a document
+        #    assistant rather than a chatbot with documents attached.
+        span = self._span("guardrail_output", SpanType.GUARDRAIL, sources=len(sources))
+        out = self._guardrails.check_output(answer_text, sources)
+        self._finish(span, output=out.to_dict())
 
-        return ChatResponse(
+        if not out.passed:
+            logger.warning("Output guardrail blocked an answer: %s", out.violations)
+            return ChatResponse(
+                answer=(
+                    "I couldn't find anything in your documents that answers this. "
+                    "Try rephrasing, or upload a document that covers it."
+                ),
+                question=question,
+                confidence=0.0,
+                trace_id=trace_id,
+                guardrail={"stage": "output", **out.to_dict()},
+            )
+
+        answer_text = out.content
+
+        # 5. Commit the turn to history and cache.
+        history.append(HumanMessage(content=question))
+        history.append(AIMessage(content=answer_text))
+
+        response = ChatResponse(
             answer=answer_text,
             sources=sources,
             confidence=confidence,
             question=question,
+            trace_id=trace_id,
+            guardrail={"stage": "output", **out.to_dict()},
         )
 
+        if self._cache:
+            self._cache.put(question, response.to_dict(), tenant_id=session_id)
+
+        return response
+
+    @staticmethod
+    def _last_answer(messages: list) -> str:
+        """The final AI message that is prose rather than a tool call."""
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.content and not getattr(msg, "tool_calls", None):
+                return msg.content if isinstance(msg.content, str) else str(msg.content)
+        return ""
+
     @log_function_call
-    def get_chat_history(self) -> List[ChatMessage]:
-        history = self._get_history(self._session_id)
+    def get_chat_history(self, session_id: str = "default") -> list[ChatMessage]:
         return [
-            ChatMessage(
-                role="human" if isinstance(m, HumanMessage) else "ai",
-                content=m.content,
-            )
-            for m in history
+            ChatMessage(role="human" if isinstance(m, HumanMessage) else "ai", content=m.content)
+            for m in self._histories.get(session_id, [])
         ]
 
     @log_function_call
-    def clear_memory(self) -> None:
-        self._chat_history.pop(self._session_id, None)
-        logger.info("Memoria limpiada")
+    def clear_memory(self, session_id: str = "default") -> None:
+        self._histories.pop(session_id, None)
+        logger.info("Cleared history for session=%s", session_id)
 
     @log_function_call
-    def get_conversation_summary(self) -> str:
-        history = self._get_history(self._session_id)
+    def get_conversation_summary(self, session_id: str = "default") -> str:
+        history = self._histories.get(session_id, [])
         if not history:
-            return "No hay historial de conversación."
-        messages_repr = [
-            {"role": "human" if isinstance(m, HumanMessage) else "ai", "content": m.content}
+            return "No conversation history yet."
+        transcript = "\n".join(
+            f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}"
             for m in history
-        ]
-        return self._llm.invoke([
-            {"role": "system", "content": "Resume la conversación de forma breve. Responde en español."},
-            {"role": "user", "content": str(messages_repr)},
-        ])
-
-    def get_mcp_status(self) -> MCPStatus:
-        return self._mcp_manager.get_status()
+        )
+        return self._llm.invoke(
+            [
+                {
+                    "role": "system",
+                    "content": "Summarize this conversation in three sentences or fewer.",
+                },
+                {"role": "user", "content": transcript},
+            ]
+        )

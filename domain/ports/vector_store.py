@@ -1,32 +1,40 @@
-"""Port: contrato para cualquier vector store."""
+"""Port: the contract any vector store must satisfy."""
 
 from __future__ import annotations
 
-from typing import Protocol, List, Sequence, runtime_checkable
+from collections.abc import Sequence
+from typing import Any, Protocol, runtime_checkable
 
 from domain.models import DocumentChunk, SearchResult
 
 
 @runtime_checkable
 class VectorStorePort(Protocol):
-    """Interfaz que debe cumplir cualquier vector store (LanceDB, Pinecone, Qdrant, etc.)."""
+    """
+    Implemented by LanceDBAdapter today; pgvector, Qdrant or Pinecone would
+    satisfy the same interface without any change above this line.
+    """
 
     def add_documents(self, docs: Sequence[DocumentChunk]) -> int:
-        """Indexa chunks. Retorna cuántos se añadieron."""
+        """Index chunks. Returns how many were added."""
         ...
 
-    def similarity_search(self, query: str, k: int = 4) -> List[SearchResult]:
-        """Búsqueda semántica con scores."""
+    def similarity_search(self, query: str, k: int = 4) -> list[SearchResult]:
+        """Return the k most similar chunks, each with a relevance score."""
         ...
 
-    def as_retriever(self, k: int = 4):
-        """Retorna un retriever compatible con LangChain."""
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a string into the same space as the indexed documents."""
         ...
 
     def get_document_count(self) -> int:
-        """Cantidad de chunks indexados."""
+        """Total number of indexed chunks."""
+        ...
+
+    def list_sources(self) -> list[dict[str, Any]]:
+        """Distinct source files with their chunk counts."""
         ...
 
     def clear(self) -> None:
-        """Elimina todos los documentos."""
+        """Delete the whole index."""
         ...

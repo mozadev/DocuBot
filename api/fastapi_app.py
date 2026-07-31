@@ -1,80 +1,89 @@
 """
-DocuBot AI — FastAPI REST API.
-Punto de entrada. Solo monta routers, middleware, y lifespan.
-Toda la logica vive en api/routes/.
+DocuBot AI - FastAPI application.
+
+Entry point only: mounts routers and middleware. All behaviour lives in
+domain/services; all wiring lives in api/factory.
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from api.factory import create_all_services
-from adapters.cache.semantic_cache import SemanticCache
-from adapters.observability.tracer import AgentTracer
-from domain.guardrails import ContentGuardrails
+from api.factory import build_container
 from api.rate_limiter import RateLimitMiddleware
-from api.routes.health import create_health_routes
-from api.routes.documents import create_document_routes
-from api.routes.chat import create_chat_routes
-from api.routes.marketing import create_marketing_routes
-from api.routes.seo import create_seo_routes
-from api.routes.infra import create_infra_routes
+from api.routes import chat, documents, health, infra, streaming
+from config.settings import settings
 from core.logger import logger
 
+DESCRIPTION = """
+Ask questions about your own documents and get answers with citations.
 
-_services = {}
+Upload PDF, DOCX, TXT or Markdown files to `/documents/upload`, then ask
+questions at `/chat`. Answers are generated only from the indexed documents; if
+the documents do not contain the answer, the API says so rather than guessing.
+
+Every response carries a `trace_id` that can be replayed against
+`/observability/traces/{trace_id}` to see the retrieval scores, guardrail
+verdicts and latency behind it.
+
+Conversation state and rate limits are keyed by the optional `X-Session-ID`
+header.
+"""
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Inicializa servicios al arrancar, limpia al apagar."""
-    logger.info("FastAPI: inicializando servicios...")
-    doc_svc, chat_svc, mkt_svc, dalle = create_all_services(session_id="fastapi")
-    _services["doc"] = doc_svc
-    _services["chat"] = chat_svc
-    _services["mkt"] = mkt_svc
-    _services["dalle"] = dalle
-    _services["cache"] = SemanticCache(max_entries=1000, default_ttl=3600)
-    _services["tracer"] = AgentTracer(max_traces=500)
-    _services["guardrails"] = ContentGuardrails()
+    """
+    Build the container at startup rather than on the first request.
 
-    from api.streaming import create_streaming_routes
-    from api.webhooks import create_webhook_routes
-
-    app.include_router(create_health_routes(_services))
-    app.include_router(create_document_routes(_services))
-    app.include_router(create_chat_routes(_services))
-    app.include_router(create_marketing_routes(_services))
-    app.include_router(create_seo_routes(_services))
-    app.include_router(create_infra_routes(_services))
-    app.include_router(create_streaming_routes(_services))
-    app.include_router(create_webhook_routes(_services))
-
-    logger.info("FastAPI: 8 routers montados, servicios listos")
+    This makes a bad API key or an unreadable database fail immediately and
+    visibly, instead of turning into a confusing 500 for whoever happens to send
+    the first question.
+    """
+    logger.info("Starting %s v%s", settings.app_name, settings.app_version)
+    build_container()
+    logger.info("Startup complete")
     yield
-    _services.clear()
-    logger.info("FastAPI: servicios liberados")
+    logger.info("Shutting down")
 
 
 app = FastAPI(
-    title="DocuBot AI API",
-    description=(
-        "API REST de DocuBot AI — Agente LangGraph + RAG Multimodal + MCP + Marketing.\n\n"
-        "Diseñada para integrarse con backends NestJS, clientes Flutter/React, etc.\n"
-        "Soporta multi-tenancy mediante el header `X-Tenant-ID`."
-    ),
-    version="1.0.0",
+    title="DocuBot AI",
+    description=DESCRIPTION,
+    version=settings.app_version,
     lifespan=lifespan,
 )
 
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "X-Session-ID"],
 )
+
+app.include_router(health.router)
+app.include_router(documents.router)
+app.include_router(chat.router)
+app.include_router(streaming.router)
+app.include_router(infra.router)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Log the traceback, return a generic message.
+
+    Stack traces in an HTTP response leak file paths and dependency versions to
+    anyone who can trigger an error.
+    """
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Check the server logs for details."},
+    )

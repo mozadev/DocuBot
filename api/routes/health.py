@@ -1,37 +1,40 @@
-"""Health & status endpoints."""
+"""Health and status endpoints."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter
-from config.settings import settings
+from fastapi import APIRouter, Depends
+
+from api.deps import get_container
 from api.schemas.common import HealthResponse, StatusResponse
+from config.settings import settings
 
 router = APIRouter(prefix="/api/v1", tags=["Health"])
 
 
-def create_health_routes(services: dict) -> APIRouter:
+@router.get("/health", response_model=HealthResponse, summary="Liveness probe")
+async def health() -> HealthResponse:
+    """
+    Cheap liveness check for the container orchestrator.
 
-    @router.get("/health", response_model=HealthResponse)
-    async def health():
-        return HealthResponse(status="ok", service="DocuBot AI", version="1.0.0")
+    Deliberately does not touch the vector store or OpenAI: a liveness probe that
+    depends on a third party will restart a healthy container during their
+    outage. Dependency state belongs in /status.
+    """
+    return HealthResponse(status="ok", service=settings.app_name, version=settings.app_version)
 
-    @router.get("/status", response_model=StatusResponse)
-    async def status():
-        doc_svc = services.get("doc")
-        chat_svc = services.get("chat")
-        mcp_info = chat_svc.get_mcp_status() if chat_svc else None
-        return StatusResponse(
-            service="DocuBot AI", version="1.0.0",
-            model=settings.openai_model,
-            embedding_model=settings.embedding_model,
-            multimodal=settings.enable_multimodal,
-            vision_model=settings.vision_model,
-            document_count=doc_svc.get_document_count() if doc_svc else 0,
-            mcp={
-                "initialized": mcp_info.initialized if mcp_info else False,
-                "connected_servers": mcp_info.connected_servers if mcp_info else 0,
-                "tools": mcp_info.tool_names if mcp_info else [],
-            },
-        )
 
-    return router
+@router.get(
+    "/status", response_model=StatusResponse, summary="Effective configuration and index size"
+)
+async def status(container=Depends(get_container)) -> StatusResponse:
+    return StatusResponse(
+        service=settings.app_name,
+        version=settings.app_version,
+        model=settings.openai_model,
+        embedding_model=settings.embedding_model,
+        multimodal=settings.enable_multimodal,
+        vision_model=settings.vision_model if settings.enable_multimodal else "disabled",
+        chunk_size=settings.chunk_size,
+        document_count=container.documents.get_document_count(),
+        supported_formats=container.documents.supported_extensions,
+    )

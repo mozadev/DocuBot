@@ -1,35 +1,40 @@
 """
-Observability: tracing completo de cada decision del agente.
-Compatible con LangSmith, pero funciona standalone.
-Registra: cada LLM call, tool call, latencia, tokens, costos estimados.
+Observability: an in-process trace of every decision the agent makes.
+
+Each request opens a trace; each meaningful step (guardrail, cache lookup,
+retrieval, agent run) opens a span inside it. That gives per-request latency
+breakdowns, token cost, and a record of which guardrail fired -- the three
+questions you actually ask when a RAG answer looks wrong.
+
+Deliberately standalone rather than a LangSmith dependency, so the project runs
+with one API key and no external account. The span model mirrors OpenTelemetry
+closely enough that exporting to OTLP is a small change; see README.
 """
 
 from __future__ import annotations
 
 import time
 import uuid
-from datetime import datetime, timezone
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Any, Optional
-from enum import Enum
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any
 
 from core.logger import logger
 
 
-class SpanType(str, Enum):
+class SpanType(StrEnum):
     LLM_CALL = "llm_call"
     TOOL_CALL = "tool_call"
     RETRIEVAL = "retrieval"
     AGENT_STEP = "agent_step"
     GUARDRAIL = "guardrail"
     CACHE_LOOKUP = "cache_lookup"
-    WEBHOOK = "webhook"
-    IMAGE_GEN = "image_generation"
 
 
 @dataclass
 class Span:
-    """Un span individual dentro de un trace."""
+    """A single timed step inside a trace."""
     id: str
     trace_id: str
     name: str
@@ -37,13 +42,13 @@ class Span:
     start_time: float
     end_time: float = 0.0
     duration_ms: float = 0.0
-    input_data: Dict[str, Any] = field(default_factory=dict)
-    output_data: Dict[str, Any] = field(default_factory=dict)
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    error: Optional[str] = None
+    input_data: dict[str, Any] = field(default_factory=dict)
+    output_data: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
     tokens_used: int = 0
     estimated_cost_usd: float = 0.0
-    parent_span_id: Optional[str] = None
+    parent_span_id: str | None = None
 
     def finish(self, output: Any = None, error: str = None) -> None:
         self.end_time = time.time()
@@ -53,7 +58,7 @@ class Span:
         if error:
             self.error = error
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["span_type"] = self.span_type.value
         return d
@@ -61,18 +66,18 @@ class Span:
 
 @dataclass
 class Trace:
-    """Un trace completo de un request."""
+    """All spans recorded for one request."""
     id: str
     tenant_id: str
-    session_type: str  # "chat", "campaign", "content"
+    session_type: str  # "chat"
     started_at: str
-    spans: List[Span] = field(default_factory=list)
+    spans: list[Span] = field(default_factory=list)
     total_duration_ms: float = 0.0
     total_tokens: int = 0
     total_cost_usd: float = 0.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
@@ -85,13 +90,14 @@ class Trace:
             "metadata": self.metadata,
         }
 
-    def to_detailed_dict(self) -> Dict[str, Any]:
+    def to_detailed_dict(self) -> dict[str, Any]:
         d = self.to_dict()
         d["spans"] = [s.to_dict() for s in self.spans]
         return d
 
 
-# Costos aproximados por modelo (USD por 1K tokens)
+# Approximate cost per 1K tokens, USD. Used for the running cost estimate shown
+# in /observability/analytics; not billing-accurate.
 MODEL_COSTS = {
     "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
     "gpt-4o": {"input": 0.0025, "output": 0.01},
@@ -101,19 +107,19 @@ MODEL_COSTS = {
 
 
 class AgentTracer:
-    """Tracing centralizado para todos los agentes."""
+    """Bounded in-memory trace store."""
 
     def __init__(self, max_traces: int = 500) -> None:
-        self._traces: Dict[str, Trace] = {}
+        self._traces: dict[str, Trace] = {}
         self._max_traces = max_traces
 
     def start_trace(
         self,
         tenant_id: str,
         session_type: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
-        """Inicia un nuevo trace. Retorna trace_id."""
+        """Start a trace and return its id."""
         if len(self._traces) >= self._max_traces:
             oldest_key = next(iter(self._traces))
             del self._traces[oldest_key]
@@ -123,7 +129,7 @@ class AgentTracer:
             id=trace_id,
             tenant_id=tenant_id,
             session_type=session_type,
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=datetime.now(UTC).isoformat(),
             metadata=metadata or {},
         )
         return trace_id
@@ -133,10 +139,10 @@ class AgentTracer:
         trace_id: str,
         name: str,
         span_type: SpanType,
-        input_data: Optional[Dict[str, Any]] = None,
-        parent_span_id: Optional[str] = None,
-    ) -> Optional[Span]:
-        """Crea y registra un span dentro de un trace."""
+        input_data: dict[str, Any] | None = None,
+        parent_span_id: str | None = None,
+    ) -> Span | None:
+        """Open a span inside an existing trace."""
         trace = self._traces.get(trace_id)
         if not trace:
             return None
@@ -161,7 +167,7 @@ class AgentTracer:
         tokens: int = 0,
         model: str = "gpt-4o-mini",
     ) -> None:
-        """Finaliza un span con su resultado."""
+        """Close a span, recording its output and token cost."""
         span.finish(output=output, error=error)
         span.tokens_used = tokens
         if tokens > 0:
@@ -173,8 +179,8 @@ class AgentTracer:
             trace.total_tokens += tokens
             trace.total_cost_usd += span.estimated_cost_usd
 
-    def finish_trace(self, trace_id: str) -> Optional[Trace]:
-        """Finaliza un trace y calcula totales."""
+    def finish_trace(self, trace_id: str) -> Trace | None:
+        """Close a trace and compute its wall-clock duration."""
         trace = self._traces.get(trace_id)
         if not trace or not trace.spans:
             return trace
@@ -192,17 +198,17 @@ class AgentTracer:
         )
         return trace
 
-    def get_trace(self, trace_id: str) -> Optional[Dict[str, Any]]:
+    def get_trace(self, trace_id: str) -> dict[str, Any] | None:
         trace = self._traces.get(trace_id)
         return trace.to_detailed_dict() if trace else None
 
-    def get_tenant_traces(self, tenant_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def get_tenant_traces(self, tenant_id: str, limit: int = 20) -> list[dict[str, Any]]:
         tenant_traces = [t for t in self._traces.values() if t.tenant_id == tenant_id]
         tenant_traces.sort(key=lambda t: t.started_at, reverse=True)
         return [t.to_dict() for t in tenant_traces[:limit]]
 
-    def get_analytics(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
-        """Analitica de uso — cuanto cuesta, que tan rapido, donde se gasta mas."""
+    def get_analytics(self, tenant_id: str | None = None) -> dict[str, Any]:
+        """Aggregate view: cost, latency, tool usage and error rate."""
         traces = list(self._traces.values())
         if tenant_id:
             traces = [t for t in traces if t.tenant_id == tenant_id]
@@ -214,12 +220,12 @@ class AgentTracer:
         total_tokens = sum(t.total_tokens for t in traces)
         avg_duration = sum(t.total_duration_ms for t in traces) / len(traces)
 
-        by_type: Dict[str, int] = {}
+        by_type: dict[str, int] = {}
         for t in traces:
             by_type[t.session_type] = by_type.get(t.session_type, 0) + 1
 
         all_spans = [s for t in traces for s in t.spans]
-        tool_usage: Dict[str, int] = {}
+        tool_usage: dict[str, int] = {}
         for s in all_spans:
             if s.span_type == SpanType.TOOL_CALL:
                 tool_usage[s.name] = tool_usage.get(s.name, 0) + 1

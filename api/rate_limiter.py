@@ -1,189 +1,131 @@
 """
-Rate limiting per-tenant.
-Evita que un tenant abuse de la API y consuma todo el budget de OpenAI.
-Configurable por tier: free, pro, enterprise.
+Per-session rate limiting.
+
+The thing being protected is the OpenAI bill: one runaway client looping on
+/chat can spend real money in minutes. A sliding window over request timestamps
+is enough for that and needs no dependencies.
+
+In-memory and per-process, so with N replicas the effective limit is N times the
+configured one. Correct behind a single container; Redis is the fix at scale,
+noted in the README.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
+from dataclasses import dataclass
 
-from fastapi import Request, HTTPException
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.responses import Response, JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from core.logger import logger
 
 
-@dataclass
-class TenantLimits:
-    """Limites por tier de tenant."""
-    requests_per_minute: int = 20
-    requests_per_hour: int = 200
-    requests_per_day: int = 1000
-    max_campaigns_per_day: int = 10
-    max_images_per_day: int = 20
-    max_tokens_per_day: int = 500_000
+@dataclass(frozen=True)
+class Limits:
+    per_minute: int = 20
+    per_hour: int = 200
+    per_day: int = 1000
 
 
-TIER_LIMITS: Dict[str, TenantLimits] = {
-    "free": TenantLimits(
-        requests_per_minute=10,
-        requests_per_hour=60,
-        requests_per_day=200,
-        max_campaigns_per_day=3,
-        max_images_per_day=5,
-        max_tokens_per_day=100_000,
-    ),
-    "pro": TenantLimits(
-        requests_per_minute=30,
-        requests_per_hour=500,
-        requests_per_day=5000,
-        max_campaigns_per_day=50,
-        max_images_per_day=100,
-        max_tokens_per_day=2_000_000,
-    ),
-    "enterprise": TenantLimits(
-        requests_per_minute=100,
-        requests_per_hour=3000,
-        requests_per_day=50000,
-        max_campaigns_per_day=500,
-        max_images_per_day=1000,
-        max_tokens_per_day=20_000_000,
-    ),
-}
+DEFAULT_LIMITS = Limits()
 
-
-@dataclass
-class _BucketState:
-    """Sliding window counter."""
-    timestamps: list = field(default_factory=list)
-
-    def count_in_window(self, window_seconds: int) -> int:
-        now = time.time()
-        cutoff = now - window_seconds
-        self.timestamps = [t for t in self.timestamps if t > cutoff]
-        return len(self.timestamps)
-
-    def add(self) -> None:
-        self.timestamps.append(time.time())
+# Probes and docs must never be rate limited: the orchestrator's health check
+# would start failing under exactly the load where you need it to be accurate.
+EXEMPT_PATHS = frozenset(
+    {"/api/v1/health", "/api/v1/status", "/docs", "/redoc", "/openapi.json"}
+)
 
 
 class RateLimiter:
-    """Rate limiter in-memory per-tenant con sliding window."""
+    """Sliding-window request counter keyed by session."""
 
-    def __init__(self, default_tier: str = "free") -> None:
-        self._buckets: Dict[str, _BucketState] = defaultdict(_BucketState)
-        self._tenant_tiers: Dict[str, str] = {}
-        self._default_tier = default_tier
+    def __init__(self, limits: Limits = DEFAULT_LIMITS) -> None:
+        self._limits = limits
+        self._windows: dict[str, deque[float]] = defaultdict(deque)
 
-    def set_tenant_tier(self, tenant_id: str, tier: str) -> None:
-        """NestJS puede configurar el tier de cada tenant."""
-        if tier not in TIER_LIMITS:
-            tier = self._default_tier
-        self._tenant_tiers[tenant_id] = tier
+    def _prune(self, key: str) -> deque[float]:
+        window = self._windows[key]
+        cutoff = time.time() - 86400
+        while window and window[0] < cutoff:
+            window.popleft()
+        return window
 
-    def check(self, tenant_id: str) -> Tuple[bool, Optional[Dict]]:
-        """
-        Retorna (allowed, info).
-        Si allowed=False, info contiene detalles del limite excedido.
-        """
-        tier = self._tenant_tiers.get(tenant_id, self._default_tier)
-        limits = TIER_LIMITS[tier]
-        bucket = self._buckets[tenant_id]
+    @staticmethod
+    def _count_since(window: deque[float], seconds: int) -> int:
+        cutoff = time.time() - seconds
+        return sum(1 for t in window if t > cutoff)
 
-        per_min = bucket.count_in_window(60)
-        if per_min >= limits.requests_per_minute:
-            return False, {
-                "error": "rate_limit_exceeded",
-                "limit": "requests_per_minute",
-                "current": per_min,
-                "max": limits.requests_per_minute,
-                "tier": tier,
-                "retry_after_seconds": 60,
-            }
+    def check(self, session_id: str) -> tuple[bool, dict]:
+        """Record a request and report whether it is allowed."""
+        window = self._prune(session_id)
 
-        per_hour = bucket.count_in_window(3600)
-        if per_hour >= limits.requests_per_hour:
-            return False, {
-                "error": "rate_limit_exceeded",
-                "limit": "requests_per_hour",
-                "current": per_hour,
-                "max": limits.requests_per_hour,
-                "tier": tier,
-                "retry_after_seconds": 3600,
-            }
+        for seconds, limit, label in (
+            (60, self._limits.per_minute, "per_minute"),
+            (3600, self._limits.per_hour, "per_hour"),
+            (86400, self._limits.per_day, "per_day"),
+        ):
+            used = self._count_since(window, seconds)
+            if used >= limit:
+                return False, {
+                    "error": "rate_limit_exceeded",
+                    "limit": label,
+                    "current": used,
+                    "max": limit,
+                    "retry_after_seconds": seconds,
+                }
 
-        per_day = bucket.count_in_window(86400)
-        if per_day >= limits.requests_per_day:
-            return False, {
-                "error": "rate_limit_exceeded",
-                "limit": "requests_per_day",
-                "current": per_day,
-                "max": limits.requests_per_day,
-                "tier": tier,
-                "retry_after_seconds": 86400,
-            }
-
-        bucket.add()
+        window.append(time.time())
         return True, {
-            "tier": tier,
-            "remaining_minute": limits.requests_per_minute - per_min - 1,
-            "remaining_hour": limits.requests_per_hour - per_hour - 1,
-            "remaining_day": limits.requests_per_day - per_day - 1,
+            "remaining_minute": self._limits.per_minute - self._count_since(window, 60),
+            "remaining_hour": self._limits.per_hour - self._count_since(window, 3600),
+            "remaining_day": self._limits.per_day - self._count_since(window, 86400),
         }
 
-    def get_usage(self, tenant_id: str) -> Dict:
-        tier = self._tenant_tiers.get(tenant_id, self._default_tier)
-        limits = TIER_LIMITS[tier]
-        bucket = self._buckets[tenant_id]
+    def get_usage(self, session_id: str) -> dict:
+        window = self._prune(session_id)
         return {
-            "tenant_id": tenant_id,
-            "tier": tier,
-            "usage_minute": bucket.count_in_window(60),
-            "limit_minute": limits.requests_per_minute,
-            "usage_hour": bucket.count_in_window(3600),
-            "limit_hour": limits.requests_per_hour,
-            "usage_day": bucket.count_in_window(86400),
-            "limit_day": limits.requests_per_day,
+            "session_id": session_id,
+            "usage_minute": self._count_since(window, 60),
+            "limit_minute": self._limits.per_minute,
+            "usage_hour": self._count_since(window, 3600),
+            "limit_hour": self._limits.per_hour,
+            "usage_day": self._count_since(window, 86400),
+            "limit_day": self._limits.per_day,
         }
 
 
-_global_limiter = RateLimiter(default_tier="free")
+_limiter: RateLimiter | None = None
 
 
 def get_rate_limiter() -> RateLimiter:
-    return _global_limiter
+    global _limiter
+    if _limiter is None:
+        _limiter = RateLimiter()
+    return _limiter
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Middleware de FastAPI que aplica rate limiting automaticamente."""
-
-    EXEMPT_PATHS = {"/api/v1/health", "/api/v1/status", "/docs", "/openapi.json", "/redoc"}
+    """Applies the rate limiter to every /api/ route except the exempt ones."""
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path
-
-        if path in self.EXEMPT_PATHS or not path.startswith("/api/"):
+        if path in EXEMPT_PATHS or not path.startswith("/api/"):
             return await call_next(request)
 
-        tenant_id = request.headers.get("X-Tenant-ID", "default")
-        limiter = get_rate_limiter()
-
-        allowed, info = limiter.check(tenant_id)
+        session_id = request.headers.get("X-Session-ID", "default")
+        allowed, info = get_rate_limiter().check(session_id)
 
         if not allowed:
-            logger.warning(f"Rate limit exceeded for tenant={tenant_id}: {info['limit']}")
+            logger.warning("Rate limit hit for session=%s (%s)", session_id, info["limit"])
             return JSONResponse(
                 status_code=429,
                 content=info,
-                headers={"Retry-After": str(info.get("retry_after_seconds", 60))},
+                headers={"Retry-After": str(info["retry_after_seconds"])},
             )
 
         response = await call_next(request)
-        response.headers["X-RateLimit-Remaining-Minute"] = str(info.get("remaining_minute", 0))
-        response.headers["X-RateLimit-Tier"] = info.get("tier", "free")
+        response.headers["X-RateLimit-Remaining-Minute"] = str(info["remaining_minute"])
         return response

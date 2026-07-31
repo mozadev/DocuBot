@@ -1,44 +1,30 @@
-DOCUBOT AI - DOCUMENTO DE EJEMPLO
+ACME CORP - EMPLOYEE HANDBOOK (SAMPLE)
 
-Este es un documento de ejemplo para probar el sistema DocuBot AI.
+This is a sample document for trying DocuBot out. Index it, then ask questions
+like "how many vacation days do I get?" or "can I work remotely?".
 
-INFORMACIÓN SOBRE LA EMPRESA:
-- Nombre: DocuBot AI Solutions
-- Fundación: 2024
-- Especialidad: Sistemas de IA para análisis de documentos
-- Tecnologías: Python, LangChain, LanceDB, OpenAI
+## 1. Vacation
 
-SERVICIOS OFRECIDOS:
-1. Procesamiento automático de documentos
-2. Análisis inteligente de contenido
-3. Chatbot especializado en documentos
-4. Base de datos vectorial para búsquedas semánticas
+Full-time employees accrue 20 days of paid vacation per year, accruing monthly
+from the start date. Unused days may be carried over into the next calendar
+year, up to a maximum of 5 days. Days beyond that are forfeited on 31 December.
 
-TECNOLOGÍAS UTILIZADAS:
-- Python 3.9+: Lenguaje de programación principal
-- LangChain: Framework para aplicaciones de IA
-- LanceDB: Base de datos vectorial de alto rendimiento
-- OpenAI API: Modelos de lenguaje avanzados
-- Streamlit: Interfaz web moderna y responsiva
+Part-time employees accrue vacation pro rata based on contracted hours.
 
-CARACTERÍSTICAS DEL SISTEMA:
-- Procesamiento de PDF y DOCX
-- Embeddings vectoriales para búsqueda semántica
-- Chat inteligente con memoria de conversación
-- Interfaz web intuitiva
-- Logging y monitoreo empresarial
-- Configuración flexible y escalable
+## 2. Remote work
 
-BENEFICIOS:
-- Ahorro de tiempo en análisis de documentos
-- Búsqueda semántica precisa
-- Interfaz fácil de usar
-- Escalabilidad empresarial
-- Integración con APIs existentes
+Employees may work remotely up to 3 days per week. Fully remote arrangements
+require written approval from a direct manager and are reviewed every 6 months.
 
-CONTACTO:
-- Email: info@docubot-ai.com
-- Sitio web: www.docubot-ai.com
-- Teléfono: +1-555-0123
+Core collaboration hours are 10:00 to 16:00 in the employee's local time zone.
 
-Este documento sirve como ejemplo para demostrar las capacidades del sistema DocuBot AI en el procesamiento y análisis de documentos empresariales.
+## 3. Equipment
+
+Every employee receives a laptop and a one-time 500 USD home office allowance.
+Equipment remains company property and must be returned when leaving.
+
+## 4. Expenses
+
+Expenses under 100 USD do not need pre-approval but require a receipt. Anything
+above 100 USD needs manager approval before the spend. Reimbursement is paid
+with the next payroll run after submission.

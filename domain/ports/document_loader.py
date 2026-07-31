@@ -1,21 +1,23 @@
-"""Port: contrato para cualquier cargador de documentos."""
+"""Port: the contract any document loader must satisfy."""
 
 from __future__ import annotations
 
-from typing import Protocol, List, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from domain.models import DocumentChunk
 
 
 @runtime_checkable
 class DocumentLoaderPort(Protocol):
-    """Interfaz que debe cumplir cualquier loader de documentos."""
+    """One implementation per file format. DocumentService dispatches by extension."""
 
-    def load(self, file_path: str) -> List[DocumentChunk]:
-        """Extrae contenido de un archivo y lo divide en chunks."""
-        ...
+    supported_extensions: list[str]
 
-    @property
-    def supported_extensions(self) -> List[str]:
-        """Extensiones de archivo que soporta este loader."""
+    def load(self, file_path: str, original_filename: str | None = None) -> list[DocumentChunk]:
+        """
+        Read a file and split it into indexable chunks.
+
+        original_filename overrides the name recorded in each chunk's metadata,
+        which matters for uploads that arrive as temp files.
+        """
         ...

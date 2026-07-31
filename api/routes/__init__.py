@@ -1,1 +1,1 @@
-"""FastAPI routers — split by domain for maintainability."""
+"""HTTP routers, one module per resource."""

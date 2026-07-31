@@ -1,7 +1,9 @@
-"""Schemas compartidos: health, status, business context."""
+"""Request and response schemas for the public API."""
 
 from __future__ import annotations
-from typing import List, Optional
+
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -18,57 +20,66 @@ class StatusResponse(BaseModel):
     embedding_model: str
     multimodal: bool
     vision_model: str
+    chunk_size: int
     document_count: int
-    mcp: dict
+    supported_formats: list[str]
 
 
-class ProductInfoSchema(BaseModel):
-    name: str
-    description: str = ""
-    price: float = 0.0
-    currency: str = "USD"
-    category: str = ""
-    image_url: str = ""
-    is_top_seller: bool = False
+class SourceSchema(BaseModel):
+    filename: str
+    content: str
+    score: float
+    content_type: str = "text"
+    image_path: str = ""
+    page_number: int = 0
 
 
-class WhatsAppMetricsSchema(BaseModel):
-    total_conversations: int = 0
-    avg_daily_messages: int = 0
-    top_questions: List[str] = Field(default_factory=list)
-    peak_hours: List[int] = Field(default_factory=list, description="Horas 0-23 con mas actividad")
-    avg_response_time_seconds: int = 0
-    conversion_rate: float = Field(0.0, description="0.0 a 1.0")
+class ChatRequest(BaseModel):
+    question: str = Field(
+        ..., min_length=1, max_length=2000, examples=["What is the vacation policy?"]
+    )
 
 
-class SalesDataSchema(BaseModel):
-    total_sales_last_30d: float = 0.0
-    total_orders_last_30d: int = 0
-    avg_ticket: float = 0.0
-    top_products: List[str] = Field(default_factory=list)
-    currency: str = "USD"
+class ChatResponse(BaseModel):
+    answer: str
+    question: str
+    sources: list[SourceSchema] = Field(default_factory=list)
+    confidence: float = 0.0
+    trace_id: str = ""
+    cached: bool = False
+    guardrail: dict[str, Any] = Field(default_factory=dict)
 
 
-class PreviousAdPerformanceSchema(BaseModel):
-    avg_cpc: float = Field(0.0, description="Costo por click promedio")
-    avg_ctr: float = Field(0.0, description="Click-through rate 0.0 a 1.0")
-    avg_cpm: float = Field(0.0, description="Costo por mil impresiones")
-    best_performing_ad: str = ""
-    best_audience_segment: str = ""
-    total_spend_last_30d: float = 0.0
-    total_conversions_last_30d: int = 0
-    currency: str = "USD"
+class ChatHistoryResponse(BaseModel):
+    session_id: str
+    messages: list[dict[str, str]]
 
 
-class BusinessContextSchema(BaseModel):
-    """Contexto de negocio que NestJS arma con datos de su BD."""
-    business_name: str = ""
-    industry: str = ""
-    location: str = ""
-    products: List[ProductInfoSchema] = Field(default_factory=list)
-    whatsapp_metrics: Optional[WhatsAppMetricsSchema] = None
-    sales_data: Optional[SalesDataSchema] = None
-    previous_ads: Optional[PreviousAdPerformanceSchema] = None
-    competitor_names: List[str] = Field(default_factory=list)
-    brand_colors: List[str] = Field(default_factory=list)
-    brand_voice: str = ""
+class SummaryResponse(BaseModel):
+    session_id: str
+    summary: str
+
+
+class UploadResult(BaseModel):
+    filename: str
+    text_chunks: int = 0
+    image_chunks: int = 0
+    total_chunks: int = 0
+    error: str = ""
+
+
+class UploadResponse(BaseModel):
+    files_processed: int
+    total_chunks_indexed: int
+    details: list[UploadResult]
+
+
+class DocumentStatsResponse(BaseModel):
+    total_chunks: int
+    status: str
+    supported_formats: list[str]
+    documents: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class MessageResponse(BaseModel):
+    message: str

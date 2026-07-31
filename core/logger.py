@@ -1,66 +1,85 @@
 """
-Sistema de logging para DocuBot AI.
+Application logging.
+
+Human-readable and coloured on a TTY for local development, plain in the log
+file. A production deployment would swap the console formatter for JSON so the
+lines are queryable in CloudWatch or Cloud Logging; that is a formatter change
+and nothing else, which is why formatting is isolated here.
 """
+
+from __future__ import annotations
 
 import logging
 import sys
-from datetime import datetime
-from typing import Optional
+from functools import wraps
+
 from config.settings import settings
 
+CONSOLE_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+FILE_FORMAT = "%(asctime)s %(levelname)s %(name)s %(funcName)s:%(lineno)d - %(message)s"
 
-class CustomFormatter(logging.Formatter):
-    COLORS = {
-        'DEBUG': '\033[36m',
-        'INFO': '\033[32m',
-        'WARNING': '\033[33m',
-        'ERROR': '\033[31m',
-        'CRITICAL': '\033[35m',
-        'RESET': '\033[0m',
-    }
+_COLORS = {
+    "DEBUG": "\033[36m",
+    "INFO": "\033[32m",
+    "WARNING": "\033[33m",
+    "ERROR": "\033[31m",
+    "CRITICAL": "\033[35m",
+}
+_RESET = "\033[0m"
 
-    def format(self, record):
-        record.timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        if hasattr(sys.stderr, 'isatty') and sys.stderr.isatty():
-            color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
-            record.levelname = f"{color}{record.levelname}{self.COLORS['RESET']}"
+
+class ColorFormatter(logging.Formatter):
+    """Colours the level name when stdout is a terminal."""
+
+    def __init__(self, fmt: str) -> None:
+        super().__init__(fmt, datefmt="%Y-%m-%d %H:%M:%S")
+        self._use_color = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+    def format(self, record: logging.LogRecord) -> str:
+        if self._use_color:
+            # Copy the record: mutating levelname in place corrupts the file
+            # handler's output, since both handlers format the same object.
+            record = logging.makeLogRecord(record.__dict__)
+            color = _COLORS.get(record.levelname, "")
+            record.levelname = f"{color}{record.levelname}{_RESET}"
         return super().format(record)
 
 
-def setup_logger(name: str = "docubot", level: Optional[str] = None) -> logging.Logger:
-    _logger = logging.getLogger(name)
-    _logger.setLevel(getattr(logging, level or settings.log_level))
+def setup_logger(name: str = "docubot", level: str | None = None) -> logging.Logger:
+    log = logging.getLogger(name)
+    log.setLevel(getattr(logging, (level or settings.log_level).upper(), logging.INFO))
 
-    if _logger.handlers:
-        return _logger
+    if log.handlers:
+        return log
 
-    console_fmt = CustomFormatter('%(timestamp)s - %(name)s - %(levelname)s - %(message)s')
-    file_fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
-
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(console_fmt)
-    _logger.addHandler(ch)
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(ColorFormatter(CONSOLE_FORMAT))
+    log.addHandler(console)
 
     if settings.log_file:
-        fh = logging.FileHandler(settings.log_file)
-        fh.setFormatter(file_fmt)
-        _logger.addHandler(fh)
+        file_handler = logging.FileHandler(settings.log_file)
+        file_handler.setFormatter(logging.Formatter(FILE_FORMAT))
+        log.addHandler(file_handler)
 
-    return _logger
+    log.propagate = False
+    return log
 
 
 logger = setup_logger()
 
 
 def log_function_call(func):
-    """Decorador para logging automático de llamadas a funciones."""
+    """Debug-level entry/exit logging. Errors are logged and re-raised."""
+
+    @wraps(func)
     def wrapper(*args, **kwargs):
-        logger.debug(f"Llamando: {func.__name__}")
+        logger.debug("-> %s", func.__name__)
         try:
             result = func(*args, **kwargs)
-            logger.debug(f"Completado: {func.__name__}")
-            return result
         except Exception as e:
-            logger.error(f"Error en {func.__name__}: {e}")
+            logger.error("%s failed: %s", func.__name__, e)
             raise
+        logger.debug("<- %s", func.__name__)
+        return result
+
     return wrapper

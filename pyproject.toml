@@ -1,0 +1,37 @@
+[project]
+name = "docubot-ai"
+version = "2.0.0"
+description = "Ask questions about your documents and get answers with citations."
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "SIM",  # simplification
+    "BLE",  # blind except
+]
+ignore = [
+    "E501",  # line length is handled by the formatter
+    # Depends()/File() in argument defaults is how FastAPI declares dependencies.
+    # The rule exists for mutable defaults, which these are not.
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on internals and use broad excepts deliberately.
+"tests/*" = ["BLE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: needs a real OPENAI_API_KEY and makes network calls",
+]

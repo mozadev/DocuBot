@@ -1,1 +1,1 @@
-"""Pydantic schemas for FastAPI — split by domain."""
+"""Pydantic schemas for the HTTP layer."""
