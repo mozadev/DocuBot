@@ -1,5 +1,7 @@
 # DocuBot AI
 
+[![CI](https://github.com/mozadev/DocuBot/actions/workflows/ci.yml/badge.svg)](https://github.com/mozadev/DocuBot/actions/workflows/ci.yml)
+
 Ask questions about your own documents and get answers that cite where they came
 from. Upload PDFs, Word files, text or Markdown; ask in plain language; get an
 answer grounded in the documents, or an honest "that is not in here" when it
@@ -34,8 +36,8 @@ You need Docker, or Python 3.11+, and an OpenAI API key.
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/mozadev/docubot.git
-cd docubot
+git clone https://github.com/mozadev/DocuBot.git
+cd DocuBot
 
 cp .env.example .env
 # open .env and set OPENAI_API_KEY
