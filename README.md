@@ -68,7 +68,7 @@ streamlit run streamlit_app.py
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 87 tests, no API key and no network needed
+pytest          # 92 tests, no API key and no network needed
 ruff check .
 ```
 
@@ -166,7 +166,7 @@ the host.
 Hexagonal, and not for its own sake. Three things fall out of it:
 
 1. **The tests run offline.** `FakeVectorStore` and `FakeLLM` implement the same
-   Protocols the real adapters do, so 87 tests exercise real service logic
+   Protocols the real adapters do, so 92 tests exercise real service logic
    without a key or a network.
 2. **Swapping infrastructure is one file.** LanceDB to pgvector, or OpenAI to
    Bedrock, is an edit in `api/factory.py` and a new adapter. Nothing in
@@ -203,7 +203,7 @@ adapters/        concrete implementations
   observability/    tracer
 agents/          LangGraph agent and its tools
 api/             FastAPI routes, Streamlit UI, composition root
-tests/           87 tests, all offline
+tests/           92 tests, all offline
 ```
 
 ---
@@ -360,7 +360,7 @@ the starting point.
 
 ### Quality controls
 
-- 87 tests, offline, covering guardrails, ingestion, retrieval, the agent's
+- 92 tests, offline, covering guardrails, ingestion, retrieval, the agent's
   citation extraction, the service composition and the HTTP contract.
 - `ruff` in CI with bugbear and blind-except rules on.
 - Citations are rebuilt from what retrieval **actually returned**, not from what
@@ -451,7 +451,7 @@ containers during their outage. Dependency state lives in `/status`.
 
 - Hexagonal architecture with Protocol-based ports, and it pays for itself in the
   test suite rather than being decoration.
-- 87 tests, all offline and deterministic. Tests named as behaviour
+- 92 tests, all offline and deterministic. Tests named as behaviour
   (`test_ungrounded_answer_is_replaced_with_a_refusal`) so a failure reads as a
   broken requirement.
 - CI on every push: lint, test, Docker build.
