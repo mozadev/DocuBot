@@ -69,6 +69,35 @@ class TestOutputGuardrail:
         )
         assert result.passed
 
+    def test_the_refusal_marker_is_recognised_and_stripped(self, guard):
+        result = guard.check_output("[NO_ANSWER] Eso no está en los documentos.", [])
+
+        assert result.passed
+        assert "[NO_ANSWER]" not in result.content
+        assert result.content == "Eso no está en los documentos."
+
+    @pytest.mark.parametrize(
+        "refusal",
+        [
+            "No encontré esa información en los documentos.",
+            "Eso no aparece en los documentos que subiste.",
+            "No hay información sobre ese tema en el contenido indexado.",
+        ],
+    )
+    def test_a_refusal_written_in_spanish_is_not_treated_as_ungrounded(self, guard, refusal):
+        # Regression: keyword detection was English-only, so a correct Spanish
+        # refusal was flagged as a hallucination and replaced with a canned
+        # English message.
+        assert guard.check_output(refusal, []).passed
+
+    def test_a_refusal_does_not_warn_about_weak_grounding(self, guard):
+        # Retrieval returned something irrelevant and the model said so. The low
+        # score is not a property of the answer, so it should not be flagged.
+        result = guard.check_output("[NO_ANSWER] Not covered by these documents.", [source(0.09)])
+
+        assert result.passed
+        assert result.warnings == []
+
     def test_warns_but_passes_on_weak_grounding(self, guard):
         result = guard.check_output("Possibly 20 days.", [source(0.11)])
         assert result.passed

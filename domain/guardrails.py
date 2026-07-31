@@ -49,6 +49,27 @@ PII_PATTERNS: list[tuple[str, str]] = [
 
 MAX_QUESTION_CHARS = 2000
 
+# The agent prefixes this to an answer when it is declining because the
+# documents do not cover the question. Detecting a refusal by keyword does not
+# work: the assistant replies in the user's language, and an English-only
+# keyword list silently reclassified correct Spanish refusals as ungrounded
+# answers and replaced them with a canned English message. An explicit marker is
+# language-independent. It is stripped before the user sees it.
+REFUSAL_MARKER = "[NO_ANSWER]"
+
+# Fallback for turns where the model omits the marker. Not exhaustive by design
+# -- it is a safety net under the marker, not the primary mechanism.
+REFUSAL_HINTS = (
+    # English
+    "don't have", "do not have", "couldn't find", "could not find",
+    "no information", "not found", "isn't in", "is not in", "no relevant",
+    "unable to find", "not covered", "cannot answer", "not in these documents",
+    # Spanish
+    "no encontr", "no aparece", "no figura", "no hay informaci",
+    "no se menciona", "no está en", "no esta en", "no puedo responder",
+    "no contiene", "no dispongo",
+)
+
 # Below this retrieval score the context is too weak to treat the answer as
 # grounded. Tuned against text-embedding-3-small cosine scores, where a genuine
 # topical match typically lands above ~0.3 and noise below it.
@@ -122,21 +143,29 @@ class RagGuardrails:
         """
         violations: list[str] = []
         warnings: list[str] = []
-        content = answer or ""
+        content = (answer or "").strip()
 
-        if not content.strip():
+        if not content:
             return GuardrailResult(
                 passed=False, violations=["Model returned an empty answer."], content=""
             )
 
+        declined = self._is_refusal(content)
+        content = content.replace(REFUSAL_MARKER, "").strip()
+
         best_score = max((getattr(s, "score", 0.0) for s in sources), default=0.0)
 
         if not sources:
-            if not self._is_refusal(content):
+            if not declined:
                 violations.append(
                     "Answer is not grounded: no documents were retrieved, but the "
                     "model answered anyway."
                 )
+        elif declined:
+            # Retrieval found passages but the model judged them irrelevant. That
+            # is a legitimate outcome, not weak grounding -- do not warn about a
+            # score the answer is not resting on.
+            pass
         elif best_score < self._min_score:
             warnings.append(
                 f"Weak grounding: best retrieval score {best_score:.3f} is below "
@@ -157,14 +186,16 @@ class RagGuardrails:
 
     @staticmethod
     def _is_refusal(answer: str) -> bool:
-        """True if the model correctly said it could not find the information."""
-        markers = [
-            "don't have", "do not have", "couldn't find", "could not find",
-            "no information", "not found", "isn't in", "is not in",
-            "no relevant", "unable to find", "not covered", "cannot answer",
-        ]
+        """
+        True if the model declined because the documents do not cover the
+        question, rather than answering from its own knowledge.
+
+        Marker first, keywords only as a fallback.
+        """
+        if REFUSAL_MARKER in answer:
+            return True
         lowered = answer.lower()
-        return any(m in lowered for m in markers)
+        return any(hint in lowered for hint in REFUSAL_HINTS)
 
     @staticmethod
     def _redact(text: str) -> tuple[str, int]:
