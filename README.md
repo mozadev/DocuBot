@@ -34,8 +34,8 @@ You need Docker, or Python 3.11+, and an OpenAI API key.
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/mozadev/DocuBot-langchain-AI.git
-cd DocuBot-langchain-AI
+git clone https://github.com/mozadev/docubot.git
+cd docubot
 
 cp .env.example .env
 # open .env and set OPENAI_API_KEY
