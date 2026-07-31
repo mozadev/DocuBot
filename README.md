@@ -13,6 +13,7 @@ Built as a take-home for the "Chat With Your Docs" brief.
 
 - [Quick start](#quick-start)
 - [What it does](#what-it-does)
+- [Where your data goes](#where-your-data-goes)
 - [Architecture](#architecture)
 - [RAG and LLM decisions](#rag-and-llm-decisions)
 - [Guardrails and quality](#guardrails-and-quality)
@@ -102,6 +103,36 @@ curl -X POST http://localhost:8000/api/v1/chat \
   blocked rather than allowed through on the model's general knowledge.
 - **Traces every request.** Each answer carries a `trace_id` you can replay to
   see the retrieval scores, guardrail verdicts, cache result and latency.
+
+---
+
+## Where your data goes
+
+Worth being explicit about, because "chat with your docs" means handing a
+document to a system.
+
+**Stays on the machine running this.** Uploads are written to a temp file, parsed,
+and the temp file is deleted immediately. What persists is the chunk text and its
+embedding in `data/vector_db/`, plus any figures extracted from a PDF as PNGs in
+`data/images/`. Both directories are gitignored — an uploaded document must never
+reach the repository. Under Docker they live in a named volume, not in the image.
+
+**Leaves the machine, to OpenAI.** This is the part that matters:
+
+- Every chunk is sent to the embeddings API at ingest.
+- Every figure is sent to the vision API as base64 at ingest.
+- On each question, the retrieved passages are sent in the prompt.
+
+OpenAI's API terms state that API data is not used for training, and is retained
+for up to 30 days for abuse monitoring. That is still a third party receiving the
+document. **Do not upload anything you are not permitted to send to OpenAI** —
+customer data, credentials, regulated personal data. For that case the swap is a
+self-hosted embedding model and a local LLM, which the ports make a two-adapter
+change, at a real cost in answer quality.
+
+**Nothing is sent anywhere else.** No telemetry, no analytics, no LangSmith. The
+tracer is in-process precisely so traces containing document text do not leave
+the host.
 
 ---
 
